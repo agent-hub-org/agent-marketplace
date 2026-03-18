@@ -1,0 +1,27 @@
+[project]
+name = "agent-marketplace"
+version = "0.1.0"
+description = "Router agent that discovers specialist agents via A2A and delegates queries"
+authors = [
+    {name = "None"}
+]
+readme = "README.md"
+requires-python = ">=3.13,<4.0"
+dependencies = [
+    "fastapi (>=0.135.1,<0.136.0)",
+    "uvicorn[standard] (>=0.42.0,<0.43.0)",
+    "a2a-sdk (>=0.2.0)",
+    "httpx (>=0.28.0)",
+    "pydantic (>=2.12.5,<3.0.0)",
+    "python-dotenv (>=1.2.2,<2.0.0)",
+    "langchain-groq (>=1.1.2,<2.0.0)",
+    "langchain-google-genai (>=4.2.1,<5.0.0)",
+    "langchain (>=1.2.12,<2.0.0)",
+]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+package-mode = false
