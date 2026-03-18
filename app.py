@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+import os
+
 from config import AGENT_URLS
 from router.registry import AgentRegistry
 from router.router_agent import EmbeddingRouter
@@ -138,4 +140,5 @@ async def health():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=9000)
+    port = int(os.getenv("PORT", 9000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
