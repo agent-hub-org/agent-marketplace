@@ -104,8 +104,6 @@ class AgentCaller:
                         parsed = json.loads(data)
                         if "text" in parsed:
                             yield parsed["text"]
-                        elif "session_id" in parsed:
-                            # Final event with session_id — yield as metadata
-                            yield json.dumps({"session_id": parsed["session_id"]})
+                        # Skip session_id metadata — it's internal, not user-facing content
                     except json.JSONDecodeError:
                         continue
