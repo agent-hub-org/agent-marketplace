@@ -30,6 +30,7 @@ class AgentCaller:
                 "id": task_id,
                 "sessionId": session_id,
                 "message": {
+                    "messageId": uuid.uuid4().hex,
                     "role": "user",
                     "parts": [{"type": "text", "text": query}],
                 },
