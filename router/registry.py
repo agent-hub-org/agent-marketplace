@@ -21,7 +21,7 @@ class AgentRegistry:
         async with httpx.AsyncClient(timeout=10.0) as client:
             async def _fetch(agent_id: str, base_url: str) -> tuple[str, dict | None]:
                 try:
-                    url = f"{base_url}/.well-known/agent.json"
+                    url = f"{base_url}/a2a/.well-known/agent.json"
                     response = await client.get(url)
                     response.raise_for_status()
                     card = response.json()
