@@ -72,7 +72,9 @@ class AgentCaller:
         logger.info("A2A call complete — response length: %d chars", len(response_text))
         return response_text
 
-    async def stream_agent(self, agent_url: str, query: str, session_id: str | None = None) -> AsyncIterator[str]:
+    async def stream_agent(self, agent_url: str, query: str, session_id: str | None = None,
+                           response_format: str | None = None,
+                           model_id: str | None = None) -> AsyncIterator[str]:
         """
         Call an agent's /ask/stream SSE endpoint and yield text chunks.
 
@@ -82,6 +84,10 @@ class AgentCaller:
         session_id = session_id or uuid.uuid4().hex
         stream_url = f"{agent_url}/ask/stream"
         payload = {"query": query, "session_id": session_id}
+        if response_format:
+            payload["response_format"] = response_format
+        if model_id:
+            payload["model_id"] = model_id
 
         logger.info("Streaming from %s — session='%s'", stream_url, session_id)
 

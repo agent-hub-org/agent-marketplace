@@ -57,10 +57,12 @@ app.add_middleware(
 class QueryRequest(BaseModel):
     query: str
     session_id: str | None = None
+    response_format: str | None = None
+    model_id: str | None = None
 
     model_config = {"json_schema_extra": {"examples": [
-        {"query": "Analyze RELIANCE.NS stock", "session_id": None},
-        {"query": "Find papers on transformer architectures", "session_id": None},
+        {"query": "Analyze RELIANCE.NS stock", "session_id": None, "response_format": "detailed", "model_id": None},
+        {"query": "Find papers on transformer architectures", "session_id": None, "response_format": "summary", "model_id": None},
     ]}}
 
 
@@ -74,6 +76,8 @@ class QueryResponse(BaseModel):
 class DirectQueryRequest(BaseModel):
     query: str
     session_id: str | None = None
+    response_format: str | None = None
+    model_id: str | None = None
 
 
 class DirectQueryResponse(BaseModel):
@@ -143,7 +147,9 @@ async def direct_query_stream(agent_id: str, request: DirectQueryRequest):
         )
 
     async def event_stream():
-        async for chunk in caller.stream_agent(agent_url, request.query, request.session_id):
+        async for chunk in caller.stream_agent(agent_url, request.query, request.session_id,
+                                               response_format=request.response_format,
+                                               model_id=request.model_id):
             yield f"data: {json.dumps({'text': chunk})}\n\n"
         yield "data: [DONE]\n\n"
 
@@ -177,7 +183,9 @@ async def query_stream(request: QueryRequest):
         yield f"data: {json.dumps({'routed_to': decision.agent_name, 'reasoning': decision.reasoning})}\n\n"
 
         # Proxy the agent's SSE stream
-        async for chunk in caller.stream_agent(agent_url, request.query, request.session_id):
+        async for chunk in caller.stream_agent(agent_url, request.query, request.session_id,
+                                               response_format=request.response_format,
+                                               model_id=request.model_id):
             yield f"data: {json.dumps({'text': chunk})}\n\n"
 
         yield "data: [DONE]\n\n"
@@ -198,6 +206,22 @@ async def refresh_agents():
     cards = registry.get_cards()
     await router.build_index(cards)
     return {"status": "refreshed", "agents_available": len(cards), "agent_ids": list(cards.keys())}
+
+
+AVAILABLE_MODELS = [
+    {"id": "groq/gpt-oss-120b", "label": "GPT-OSS 120B (Groq)", "provider": "groq"},
+    {"id": "groq/llama-4-scout", "label": "Llama 4 Scout (Groq)", "provider": "groq"},
+    {"id": "groq/llama-4-maverick", "label": "Llama 4 Maverick (Groq)", "provider": "groq"},
+    {"id": "gemini/gemini-2.5-flash", "label": "Gemini 2.5 Flash", "provider": "gemini"},
+    {"id": "gemini/gemini-2.5-pro", "label": "Gemini 2.5 Pro", "provider": "gemini"},
+    {"id": "nvidia/nemotron-120b", "label": "Nemotron 120B (NVIDIA)", "provider": "nvidia"},
+]
+
+
+@app.get("/models")
+async def list_models():
+    """List available LLM models that can be selected from the frontend."""
+    return {"models": AVAILABLE_MODELS}
 
 
 @app.get("/health")
