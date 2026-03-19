@@ -130,6 +130,26 @@ async def direct_query(agent_id: str, request: DirectQueryRequest):
     )
 
 
+@app.post("/agents/{agent_id}/query/stream")
+async def direct_query_stream(agent_id: str, request: DirectQueryRequest):
+    """Stream a response from a specific agent, bypassing the router."""
+    logger.info("POST /agents/%s/query/stream — query='%s'", agent_id, request.query[:100])
+
+    agent_url = registry.get_url(agent_id)
+    if not agent_url:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Agent '{agent_id}' not found. Available: {list(AGENT_URLS.keys())}",
+        )
+
+    async def event_stream():
+        async for chunk in caller.stream_agent(agent_url, request.query, request.session_id):
+            yield f"data: {json.dumps({'text': chunk})}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
 @app.post("/query/stream")
 async def query_stream(request: QueryRequest):
     """Route a query to the best agent and stream the response as SSE.
