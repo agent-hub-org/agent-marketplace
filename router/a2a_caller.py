@@ -1,5 +1,7 @@
+import json
 import logging
 import uuid
+from collections.abc import AsyncIterator
 
 import httpx
 
@@ -7,7 +9,7 @@ logger = logging.getLogger("marketplace.a2a_caller")
 
 
 class AgentCaller:
-    """Sends tasks to agents via the A2A protocol."""
+    """Sends tasks to agents via the A2A protocol and supports SSE streaming."""
 
     async def call_agent(self, agent_url: str, query: str, session_id: str | None = None) -> str:
         """
@@ -69,3 +71,35 @@ class AgentCaller:
         response_text = "\n".join(texts) if texts else "No response from agent."
         logger.info("A2A call complete — response length: %d chars", len(response_text))
         return response_text
+
+    async def stream_agent(self, agent_url: str, query: str, session_id: str | None = None) -> AsyncIterator[str]:
+        """
+        Call an agent's /ask/stream SSE endpoint and yield text chunks.
+
+        This bypasses A2A for streaming — the agents expose /ask/stream which
+        returns SSE events with {"text": "..."} payloads.
+        """
+        session_id = session_id or uuid.uuid4().hex
+        stream_url = f"{agent_url}/ask/stream"
+        payload = {"query": query, "session_id": session_id}
+
+        logger.info("Streaming from %s — session='%s'", stream_url, session_id)
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
+            async with client.stream("POST", stream_url, json=payload) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data = line[6:]  # strip "data: " prefix
+                    if data == "[DONE]":
+                        return
+                    try:
+                        parsed = json.loads(data)
+                        if "text" in parsed:
+                            yield parsed["text"]
+                        elif "session_id" in parsed:
+                            # Final event with session_id — yield as metadata
+                            yield json.dumps({"session_id": parsed["session_id"]})
+                    except json.JSONDecodeError:
+                        continue

@@ -1,3 +1,4 @@
+import json
 import logging
 from contextlib import asynccontextmanager
 
@@ -5,6 +6,7 @@ import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 import os
@@ -126,6 +128,41 @@ async def direct_query(agent_id: str, request: DirectQueryRequest):
         query=request.query,
         response=response_text,
     )
+
+
+@app.post("/query/stream")
+async def query_stream(request: QueryRequest):
+    """Route a query to the best agent and stream the response as SSE.
+
+    Uses the agent's /ask/stream endpoint directly for real-time streaming.
+    Each SSE event contains {"text": "..."} with a token chunk.
+    The stream ends with a [DONE] sentinel.
+    """
+    logger.info("POST /query/stream — query='%s'", request.query[:100])
+
+    if not registry.get_cards():
+        raise HTTPException(status_code=503, detail="No agents available. Try POST /agents/refresh.")
+
+    decision = await router.route(request.query)
+
+    agent_url = registry.get_url(decision.agent_name)
+    if not agent_url:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Agent '{decision.agent_name}' not found. Available: {list(registry.get_cards().keys())}",
+        )
+
+    async def event_stream():
+        # Send routing metadata as the first event
+        yield f"data: {json.dumps({'routed_to': decision.agent_name, 'reasoning': decision.reasoning})}\n\n"
+
+        # Proxy the agent's SSE stream
+        async for chunk in caller.stream_agent(agent_url, request.query, request.session_id):
+            yield f"data: {json.dumps({'text': chunk})}\n\n"
+
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.get("/agents")
