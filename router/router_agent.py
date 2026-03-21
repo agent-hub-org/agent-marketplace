@@ -1,6 +1,7 @@
 import logging
+import os
 
-from langchain_nvidia_ai_endpoints import NVIDIAEmbeddings
+from langchain_openai import OpenAIEmbeddings
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("marketplace.router")
@@ -20,7 +21,11 @@ class EmbeddingRouter:
     """
 
     def __init__(self):
-        self._embeddings = NVIDIAEmbeddings(model="nvidia/nv-embed-v1")
+        self._embeddings = OpenAIEmbeddings(
+            base_url=os.environ["AZURE_AI_FOUNDRY_ENDPOINT"],
+            api_key=os.environ["AZURE_AI_FOUNDRY_API_KEY"],
+            model="text-embedding-3-small",
+        )
         self._agent_embeddings: dict[str, list[float]] = {}
         self._agent_descriptions: dict[str, str] = {}
 
