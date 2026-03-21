@@ -4,10 +4,12 @@ from contextlib import asynccontextmanager
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
+
+import httpx
 
 import os
 
@@ -222,6 +224,63 @@ AVAILABLE_MODELS = [
 async def list_models():
     """List available LLM models that can be selected from the frontend."""
     return {"models": AVAILABLE_MODELS}
+
+
+# ── File proxy endpoints (upload / download / list) ──
+
+@app.post("/agents/{agent_id}/upload/{upload_type}")
+async def proxy_upload(agent_id: str, upload_type: str, file: UploadFile = File(...), session_id: str = Form(...)):
+    """Proxy a file upload to the target agent."""
+    agent_url = registry.get_url(agent_id)
+    if not agent_url:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
+
+    file_bytes = await file.read()
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(
+            f"{agent_url}/upload/{upload_type}",
+            files={"file": (file.filename, file_bytes, file.content_type)},
+            data={"session_id": session_id},
+        )
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()
+
+
+@app.get("/agents/{agent_id}/download/{file_id}")
+async def proxy_download(agent_id: str, file_id: str):
+    """Proxy a file download from the target agent."""
+    agent_url = registry.get_url(agent_id)
+    if not agent_url:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.get(f"{agent_url}/download/{file_id}")
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+
+    return Response(
+        content=resp.content,
+        media_type=resp.headers.get("content-type", "application/octet-stream"),
+        headers={"Content-Disposition": resp.headers.get("content-disposition", "")},
+    )
+
+
+@app.get("/agents/{agent_id}/files/{session_id}")
+async def proxy_list_files(agent_id: str, session_id: str):
+    """Proxy a file listing request to the target agent."""
+    agent_url = registry.get_url(agent_id)
+    if not agent_url:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(f"{agent_url}/files/{session_id}")
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()
 
 
 @app.get("/health")
