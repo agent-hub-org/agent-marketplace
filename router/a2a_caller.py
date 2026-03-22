@@ -74,7 +74,8 @@ class AgentCaller:
 
     async def stream_agent(self, agent_url: str, query: str, session_id: str | None = None,
                            response_format: str | None = None,
-                           model_id: str | None = None) -> AsyncIterator[str]:
+                           model_id: str | None = None,
+                           user_id: str | None = None) -> AsyncIterator[str]:
         """
         Call an agent's /ask/stream SSE endpoint and yield text chunks.
 
@@ -89,10 +90,14 @@ class AgentCaller:
         if model_id:
             payload["model_id"] = model_id
 
+        headers = {}
+        if user_id:
+            headers["X-User-Id"] = user_id
+
         logger.info("Streaming from %s — session='%s'", stream_url, session_id)
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
-            async with client.stream("POST", stream_url, json=payload) as response:
+            async with client.stream("POST", stream_url, json=payload, headers=headers) as response:
                 response.raise_for_status()
                 async for line in response.aiter_lines():
                     if not line.startswith("data: "):

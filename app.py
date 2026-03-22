@@ -1,17 +1,34 @@
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
+from jose import JWTError, jwt as _jwt
 from pydantic import BaseModel
 
 import httpx
 
-import os
+_JWT_SECRET = os.getenv("AUTH_JWT_SECRET", "change-me-in-production")
+_JWT_ALGORITHM = "HS256"
+
+
+def _create_token(user_id: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(days=30)
+    return _jwt.encode({"sub": user_id, "exp": expire}, _JWT_SECRET, algorithm=_JWT_ALGORITHM)
+
+
+def _decode_token(token: str) -> str | None:
+    try:
+        payload = _jwt.decode(token, _JWT_SECRET, algorithms=[_JWT_ALGORITHM])
+        return payload.get("sub")
+    except JWTError:
+        return None
 
 from config import AGENT_URLS
 from router.registry import AgentRegistry
@@ -137,7 +154,7 @@ async def direct_query(agent_id: str, request: DirectQueryRequest):
 
 
 @app.post("/agents/{agent_id}/query/stream")
-async def direct_query_stream(agent_id: str, request: DirectQueryRequest):
+async def direct_query_stream(agent_id: str, request: DirectQueryRequest, http_request: Request):
     """Stream a response from a specific agent, bypassing the router."""
     logger.info("POST /agents/%s/query/stream — query='%s'", agent_id, request.query[:100])
 
@@ -148,10 +165,14 @@ async def direct_query_stream(agent_id: str, request: DirectQueryRequest):
             detail=f"Agent '{agent_id}' not found. Available: {list(AGENT_URLS.keys())}",
         )
 
+    raw = http_request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    user_id = _decode_token(raw) if raw else None
+
     async def event_stream():
         async for chunk in caller.stream_agent(agent_url, request.query, request.session_id,
                                                response_format=request.response_format,
-                                               model_id=request.model_id):
+                                               model_id=request.model_id,
+                                               user_id=user_id):
             yield f"data: {json.dumps({'text': chunk})}\n\n"
         yield "data: [DONE]\n\n"
 
@@ -159,7 +180,7 @@ async def direct_query_stream(agent_id: str, request: DirectQueryRequest):
 
 
 @app.post("/query/stream")
-async def query_stream(request: QueryRequest):
+async def query_stream(request: QueryRequest, http_request: Request):
     """Route a query to the best agent and stream the response as SSE.
 
     Uses the agent's /ask/stream endpoint directly for real-time streaming.
@@ -180,6 +201,9 @@ async def query_stream(request: QueryRequest):
             detail=f"Agent '{decision.agent_name}' not found. Available: {list(registry.get_cards().keys())}",
         )
 
+    raw = http_request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    user_id = _decode_token(raw) if raw else None
+
     async def event_stream():
         # Send routing metadata as the first event
         yield f"data: {json.dumps({'routed_to': decision.agent_name, 'reasoning': decision.reasoning})}\n\n"
@@ -187,7 +211,8 @@ async def query_stream(request: QueryRequest):
         # Proxy the agent's SSE stream
         async for chunk in caller.stream_agent(agent_url, request.query, request.session_id,
                                                response_format=request.response_format,
-                                               model_id=request.model_id):
+                                               model_id=request.model_id,
+                                               user_id=user_id):
             yield f"data: {json.dumps({'text': chunk})}\n\n"
 
         yield "data: [DONE]\n\n"
@@ -281,6 +306,48 @@ async def proxy_list_files(agent_id: str, session_id: str):
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get(f"{agent_url}/files/{session_id}")
 
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()
+
+
+@app.post("/auth/register")
+async def proxy_register(http_request: Request):
+    """Proxy registration to the financial agent, then attach a JWT token here."""
+    body = await http_request.json()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(f"{AGENT_URLS['financial-agent']}/auth/register", json=body)
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.json())
+    data = resp.json()
+    return {**data, "token": _create_token(data["user_id"])}
+
+
+@app.post("/auth/login")
+async def proxy_login(http_request: Request):
+    """Proxy login to the financial agent, then attach a JWT token here."""
+    body = await http_request.json()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(f"{AGENT_URLS['financial-agent']}/auth/login", json=body)
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.json())
+    data = resp.json()
+    return {**data, "token": _create_token(data["user_id"])}
+
+
+@app.get("/agents/{agent_id}/history/me")
+async def proxy_history(agent_id: str, http_request: Request):
+    """Verify JWT here, then forward user_id to the agent via X-User-Id header."""
+    raw = http_request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    user_id = _decode_token(raw) if raw else None
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    agent_url = registry.get_url(agent_id)
+    if not agent_url:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(f"{agent_url}/history/user/me",
+                                headers={"X-User-Id": user_id})
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     return resp.json()
