@@ -55,6 +55,7 @@ async def lifespan(app: FastAPI):
     await router.build_index(registry.get_cards())
     logger.info("Marketplace started — %d agent(s) registered", len(registry.get_cards()))
     yield
+    await caller.close()
     logger.info("Marketplace shutdown")
 
 

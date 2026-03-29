@@ -11,6 +11,13 @@ logger = logging.getLogger("marketplace.a2a_caller")
 class AgentCaller:
     """Sends tasks to agents via the A2A protocol and supports SSE streaming."""
 
+    def __init__(self):
+        # Re-use connection pool for latency benefits
+        self._client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0))
+
+    async def close(self):
+        await self._client.aclose()
+
     async def call_agent(self, agent_url: str, query: str, session_id: str | None = None) -> str:
         """
         Send a message/send request to an A2A agent and return the response text.
@@ -43,10 +50,9 @@ class AgentCaller:
         a2a_endpoint = f"{agent_url}/a2a/"
         logger.info("Calling A2A agent at %s — task_id='%s'", a2a_endpoint, task_id)
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
-            response = await client.post(a2a_endpoint, json=payload)
-            response.raise_for_status()
-            data = response.json()
+        response = await self._client.post(a2a_endpoint, json=payload)
+        response.raise_for_status()
+        data = response.json()
 
         # Extract the response text from A2A result
         result = data.get("result", {})
@@ -96,10 +102,9 @@ class AgentCaller:
 
         logger.info("Streaming from %s — session='%s'", stream_url, session_id)
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
-            async with client.stream("POST", stream_url, json=payload, headers=headers) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
+        async with self._client.stream("POST", stream_url, json=payload, headers=headers) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
                     if not line.startswith("data: "):
                         continue
                     data = line[6:]  # strip "data: " prefix
