@@ -1,18 +1,31 @@
 import json
 import logging
 import os
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
+import bcrypt
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from jose import JWTError, jwt as _jwt
+from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel
 
 import httpx
+
+_MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+_auth_client: AsyncIOMotorClient | None = None
+
+
+def _users_collection():
+    global _auth_client
+    if _auth_client is None:
+        _auth_client = AsyncIOMotorClient(_MONGO_URI)
+    return _auth_client["agent_auth"]["users"]
 
 _JWT_SECRET = os.getenv("AUTH_JWT_SECRET", "change-me-in-production")
 _JWT_ALGORITHM = "HS256"
@@ -51,6 +64,7 @@ caller = AgentCaller()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    await _users_collection().create_index("email", unique=True)
     await registry.refresh()
     await router.build_index(registry.get_cards())
     logger.info("Marketplace started — %d agent(s) registered", len(registry.get_cards()))
@@ -319,28 +333,41 @@ def _parse_error(resp) -> str:
         return resp.text or f"Agent returned {resp.status_code}"
 
 
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
 @app.post("/auth/register")
-async def proxy_register(http_request: Request):
-    """Proxy registration to the financial agent, then attach a JWT token here."""
-    body = await http_request.json()
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(f"{AGENT_URLS['financial-agent']}/auth/register", json=body)
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=_parse_error(resp))
-    data = resp.json()
-    return {**data, "token": _create_token(data["user_id"])}
+async def register(request: RegisterRequest):
+    col = _users_collection()
+    email = request.email.lower().strip()
+    if await col.find_one({"email": email}):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
+    user_id = uuid.uuid4().hex
+    await col.insert_one({
+        "user_id": user_id,
+        "email": email,
+        "password_hash": bcrypt.hashpw(request.password.encode(), bcrypt.gensalt()).decode(),
+        "created_at": datetime.now(timezone.utc),
+    })
+    logger.info("Registered user email='%s'", email)
+    return {"user_id": user_id, "email": email, "token": _create_token(user_id)}
 
 
 @app.post("/auth/login")
-async def proxy_login(http_request: Request):
-    """Proxy login to the financial agent, then attach a JWT token here."""
-    body = await http_request.json()
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(f"{AGENT_URLS['financial-agent']}/auth/login", json=body)
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=_parse_error(resp))
-    data = resp.json()
-    return {**data, "token": _create_token(data["user_id"])}
+async def login(request: LoginRequest):
+    col = _users_collection()
+    user = await col.find_one({"email": request.email.lower().strip()}, {"_id": 0})
+    if not user or not bcrypt.checkpw(request.password.encode(), user["password_hash"].encode()):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
+    logger.info("Login user='%s'", user["user_id"])
+    return {"user_id": user["user_id"], "email": user["email"], "token": _create_token(user["user_id"])}
 
 
 @app.get("/agents/{agent_id}/history/me")
