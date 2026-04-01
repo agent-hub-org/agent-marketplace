@@ -24,4 +24,4 @@ jobs:
             cd ~/deploy
             docker compose build --no-cache agent-marketplace
             docker compose up -d --no-deps agent-marketplace
-            docker image prune -f
+            docker image prune -f || true
