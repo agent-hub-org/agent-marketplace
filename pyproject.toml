@@ -20,6 +20,7 @@ dependencies = [
     "python-jose[cryptography] (>=3.3.0,<4.0.0)",
     "motor (>=3.7.1,<4.0.0)",
     "bcrypt (>=4.0.0)",
+    "slowapi>=0.1.9",
 ]
 
 [build-system]

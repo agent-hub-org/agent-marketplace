@@ -14,6 +14,10 @@ from fastapi.responses import Response, StreamingResponse
 from jose import JWTError, jwt as _jwt
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
 
 import httpx
 
@@ -31,14 +35,33 @@ _JWT_SECRET = os.getenv("AUTH_JWT_SECRET", "change-me-in-production")
 _JWT_ALGORITHM = "HS256"
 
 
-def _create_token(user_id: str) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(days=30)
-    return _jwt.encode({"sub": user_id, "exp": expire}, _JWT_SECRET, algorithm=_JWT_ALGORITHM)
+def _create_access_token(user_id: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(hours=1)
+    return _jwt.encode({"sub": user_id, "exp": expire, "type": "access"}, _JWT_SECRET, algorithm=_JWT_ALGORITHM)
+
+
+def _create_refresh_token(user_id: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(days=7)
+    return _jwt.encode({"sub": user_id, "exp": expire, "type": "refresh"}, _JWT_SECRET, algorithm=_JWT_ALGORITHM)
 
 
 def _decode_token(token: str) -> str | None:
+    """Decode an access token. Rejects refresh tokens to prevent type confusion."""
     try:
         payload = _jwt.decode(token, _JWT_SECRET, algorithms=[_JWT_ALGORITHM])
+        if payload.get("type") != "access":
+            return None
+        return payload.get("sub")
+    except JWTError:
+        return None
+
+
+def _decode_refresh_token(token: str) -> str | None:
+    """Decode a refresh token only."""
+    try:
+        payload = _jwt.decode(token, _JWT_SECRET, algorithms=[_JWT_ALGORITHM])
+        if payload.get("type") != "refresh":
+            return None
         return payload.get("sub")
     except JWTError:
         return None
@@ -56,6 +79,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("marketplace.api")
+limiter = Limiter(key_func=get_remote_address)
 
 registry = AgentRegistry(AGENT_URLS)
 router = EmbeddingRouter()
@@ -79,9 +103,18 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+if os.getenv("HTTPS_REDIRECT", "").lower() == "true":
+    app.add_middleware(HTTPSRedirectMiddleware)
+
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:5173")
+_allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -121,7 +154,8 @@ class DirectQueryResponse(BaseModel):
 
 
 @app.post("/query", response_model=QueryResponse)
-async def query(request: QueryRequest):
+@limiter.limit("30/minute")
+async def query(http_request: Request, request: QueryRequest):
     """Route a query to the best agent via embedding-based routing."""
     logger.info("POST /query — query='%s'", request.query[:100])
 
@@ -148,7 +182,8 @@ async def query(request: QueryRequest):
 
 
 @app.post("/agents/{agent_id}/query", response_model=DirectQueryResponse)
-async def direct_query(agent_id: str, request: DirectQueryRequest):
+@limiter.limit("30/minute")
+async def direct_query(agent_id: str, http_request: Request, request: DirectQueryRequest):
     """Call a specific agent directly via A2A, bypassing the router."""
     logger.info("POST /agents/%s/query — query='%s'", agent_id, request.query[:100])
 
@@ -169,6 +204,7 @@ async def direct_query(agent_id: str, request: DirectQueryRequest):
 
 
 @app.post("/agents/{agent_id}/query/stream")
+@limiter.limit("30/minute")
 async def direct_query_stream(agent_id: str, request: DirectQueryRequest, http_request: Request):
     """Stream a response from a specific agent, bypassing the router."""
     logger.info("POST /agents/%s/query/stream — query='%s'", agent_id, request.query[:100])
@@ -195,6 +231,7 @@ async def direct_query_stream(agent_id: str, request: DirectQueryRequest, http_r
 
 
 @app.post("/query/stream")
+@limiter.limit("30/minute")
 async def query_stream(request: QueryRequest, http_request: Request):
     """Route a query to the best agent and stream the response as SSE.
 
@@ -344,30 +381,59 @@ class LoginRequest(BaseModel):
 
 
 @app.post("/auth/register")
-async def register(request: RegisterRequest):
+@limiter.limit("10/minute")
+async def register(request: Request, body: RegisterRequest):
     col = _users_collection()
-    email = request.email.lower().strip()
+    email = body.email.lower().strip()
     if await col.find_one({"email": email}):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
     user_id = uuid.uuid4().hex
     await col.insert_one({
         "user_id": user_id,
         "email": email,
-        "password_hash": bcrypt.hashpw(request.password.encode(), bcrypt.gensalt()).decode(),
+        "password_hash": bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode(),
         "created_at": datetime.now(timezone.utc),
     })
     logger.info("Registered user email='%s'", email)
-    return {"user_id": user_id, "email": email, "token": _create_token(user_id)}
+    return {
+        "user_id": user_id,
+        "email": email,
+        "token": _create_access_token(user_id),
+        "refresh_token": _create_refresh_token(user_id),
+    }
 
 
 @app.post("/auth/login")
-async def login(request: LoginRequest):
+@limiter.limit("10/minute")
+async def login(request: Request, body: LoginRequest):
     col = _users_collection()
-    user = await col.find_one({"email": request.email.lower().strip()}, {"_id": 0})
-    if not user or not bcrypt.checkpw(request.password.encode(), user["password_hash"].encode()):
+    user = await col.find_one({"email": body.email.lower().strip()}, {"_id": 0})
+    if not user or not bcrypt.checkpw(body.password.encode(), user["password_hash"].encode()):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
     logger.info("Login user='%s'", user["user_id"])
-    return {"user_id": user["user_id"], "email": user["email"], "token": _create_token(user["user_id"])}
+    return {
+        "user_id": user["user_id"],
+        "email": user["email"],
+        "token": _create_access_token(user["user_id"]),
+        "refresh_token": _create_refresh_token(user["user_id"]),
+    }
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+@app.post("/auth/refresh")
+@limiter.limit("20/minute")
+async def refresh_token_endpoint(request: Request, body: RefreshRequest):
+    user_id = _decode_refresh_token(body.refresh_token)
+    if not user_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired refresh token")
+    logger.info("Token refresh for user='%s'", user_id)
+    return {
+        "token": _create_access_token(user_id),
+        "refresh_token": _create_refresh_token(user_id),
+    }
 
 
 @app.get("/agents/{agent_id}/history/me")
@@ -395,4 +461,6 @@ async def health():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 9000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    ssl_certfile = os.getenv("SSL_CERTFILE") or None
+    ssl_keyfile = os.getenv("SSL_KEYFILE") or None
+    uvicorn.run(app, host="0.0.0.0", port=port, ssl_certfile=ssl_certfile, ssl_keyfile=ssl_keyfile)
