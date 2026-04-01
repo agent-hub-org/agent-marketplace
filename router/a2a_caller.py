@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import uuid
@@ -19,7 +20,8 @@ class AgentCaller:
         await self._client.aclose()
 
     async def call_agent(self, agent_url: str, query: str, session_id: str | None = None,
-                   user_id: str | None = None, mode: str | None = None) -> str:
+                   user_id: str | None = None, mode: str | None = None,
+                   request_id: str | None = None) -> str:
         """
         Send a message/send request to an A2A agent and return the response text.
 
@@ -29,6 +31,7 @@ class AgentCaller:
             session_id: Optional session ID for conversation continuity
             user_id: Optional user ID for personalization
             mode: Optional agent execution mode
+            request_id: Optional request correlation ID (forwarded as X-Request-ID)
         """
         task_id = uuid.uuid4().hex
         session_id = session_id or uuid.uuid4().hex
@@ -55,11 +58,39 @@ class AgentCaller:
         }
 
         a2a_endpoint = f"{agent_url}/a2a/"
+        headers: dict[str, str] = {}
+        if request_id:
+            headers["X-Request-ID"] = request_id
         logger.info("Calling A2A agent at %s — task_id='%s'", a2a_endpoint, task_id)
 
-        response = await self._client.post(a2a_endpoint, json=payload)
-        response.raise_for_status()
-        data = response.json()
+        _MAX_RETRIES = 3
+        data = None
+        for attempt in range(_MAX_RETRIES):
+            try:
+                response = await self._client.post(a2a_endpoint, json=payload, headers=headers)
+                response.raise_for_status()
+                data = response.json()
+                break
+            except (httpx.TransportError, httpx.TimeoutException) as e:
+                if attempt == _MAX_RETRIES - 1:
+                    raise
+                backoff = 2 ** attempt
+                logger.warning(
+                    "A2A call failed (attempt %d/%d): %s — retrying in %ds",
+                    attempt + 1, _MAX_RETRIES, e, backoff,
+                )
+                await asyncio.sleep(backoff)
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code < 500:
+                    raise
+                if attempt == _MAX_RETRIES - 1:
+                    raise
+                backoff = 2 ** attempt
+                logger.warning(
+                    "A2A call HTTP %d (attempt %d/%d) — retrying in %ds",
+                    e.response.status_code, attempt + 1, _MAX_RETRIES, backoff,
+                )
+                await asyncio.sleep(backoff)
 
         # Extract the response text from A2A result
         result = data.get("result", {})
@@ -88,7 +119,8 @@ class AgentCaller:
     async def stream_agent(self, agent_url: str, query: str, session_id: str | None = None,
                            response_format: str | None = None,
                            model_id: str | None = None,
-                           user_id: str | None = None) -> AsyncIterator[str]:
+                           user_id: str | None = None,
+                           request_id: str | None = None) -> AsyncIterator[str]:
         """
         Call an agent's /ask/stream SSE endpoint and yield text chunks.
 
@@ -103,9 +135,11 @@ class AgentCaller:
         if model_id:
             payload["model_id"] = model_id
 
-        headers = {}
+        headers: dict[str, str] = {}
         if user_id:
             headers["X-User-Id"] = user_id
+        if request_id:
+            headers["X-Request-ID"] = request_id
 
         logger.info("Streaming from %s — session='%s'", stream_url, session_id)
 

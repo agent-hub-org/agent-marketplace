@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
 
 import httpx
@@ -73,13 +74,35 @@ from router.a2a_caller import AgentCaller
 
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+class _JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        doc = {
+            "ts": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        if record.exc_info:
+            doc["exc"] = self.formatException(record.exc_info)
+        return json.dumps(doc, ensure_ascii=False)
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(_JsonFormatter())
+logging.root.setLevel(logging.INFO)
+logging.root.addHandler(_handler)
 logger = logging.getLogger("marketplace.api")
 limiter = Limiter(key_func=get_remote_address)
+
+class _RequestIDMiddleware(BaseHTTPMiddleware):
+    """Generate or propagate X-Request-ID for every request."""
+
+    async def dispatch(self, request, call_next):
+        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        request.state.request_id = request_id
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+
 
 registry = AgentRegistry(AGENT_URLS)
 router = EmbeddingRouter()
@@ -119,6 +142,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(_RequestIDMiddleware)
 
 
 class QueryRequest(BaseModel):
@@ -174,8 +198,16 @@ async def query(request: Request, body: QueryRequest):
     elif decision.agent_name == "research-agent":
         mode = "researcher"
 
+    agent_url = registry.get_url(decision.agent_name)
+    if not agent_url:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Agent '{decision.agent_name}' not found. Available: {list(AGENT_URLS.keys())}",
+        )
+
     response_text = await caller.call_agent(
-        agent_url, body.query, body.session_id, user_id=user_id, mode=mode
+        agent_url, body.query, body.session_id, user_id=user_id, mode=mode,
+        request_id=request.state.request_id,
     )
 
     return QueryResponse(
@@ -210,7 +242,8 @@ async def direct_query(agent_id: str, request: Request, body: DirectQueryRequest
         mode = "researcher"
 
     response_text = await caller.call_agent(
-        agent_url, body.query, body.session_id, user_id=user_id, mode=mode
+        agent_url, body.query, body.session_id, user_id=user_id, mode=mode,
+        request_id=request.state.request_id,
     )
 
     return DirectQueryResponse(
@@ -236,11 +269,13 @@ async def direct_query_stream(agent_id: str, body: DirectQueryRequest, request: 
     raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
     user_id = _decode_token(raw) if raw else None
 
+    _request_id = request.state.request_id
     async def event_stream():
         async for chunk in caller.stream_agent(agent_url, body.query, body.session_id,
                                                response_format=body.response_format,
                                                model_id=body.model_id,
-                                               user_id=user_id):
+                                               user_id=user_id,
+                                               request_id=_request_id):
             yield f"data: {json.dumps({'text': chunk})}\n\n"
         yield "data: [DONE]\n\n"
 
@@ -273,6 +308,7 @@ async def query_stream(body: QueryRequest, request: Request):
     raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
     user_id = _decode_token(raw) if raw else None
 
+    _request_id = request.state.request_id
     async def event_stream():
         # Send routing metadata as the first event
         yield f"data: {json.dumps({'routed_to': decision.agent_name, 'reasoning': decision.reasoning})}\n\n"
@@ -281,7 +317,8 @@ async def query_stream(body: QueryRequest, request: Request):
         async for chunk in caller.stream_agent(agent_url, body.query, body.session_id,
                                                response_format=body.response_format,
                                                model_id=body.model_id,
-                                               user_id=user_id):
+                                               user_id=user_id,
+                                               request_id=_request_id):
             yield f"data: {json.dumps({'text': chunk})}\n\n"
 
         yield "data: [DONE]\n\n"
@@ -297,11 +334,19 @@ async def list_agents():
 
 @app.post("/agents/refresh")
 async def refresh_agents():
-    """Re-fetch Agent Cards and rebuild the embedding index."""
-    await registry.refresh()
+    """Re-fetch Agent Cards and rebuild the embedding index.
+
+    Skips re-embedding when agent cards are unchanged (returns status 'no_change').
+    """
+    changed = await registry.refresh()
     cards = registry.get_cards()
-    await router.build_index(cards)
-    return {"status": "refreshed", "agents_available": len(cards), "agent_ids": list(cards.keys())}
+    if changed:
+        await router.build_index(cards)
+    return {
+        "status": "refreshed" if changed else "no_change",
+        "agents_available": len(cards),
+        "agent_ids": list(cards.keys()),
+    }
 
 
 AVAILABLE_MODELS = [

@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import logging
 
 import httpx
@@ -12,11 +14,20 @@ class AgentRegistry:
     def __init__(self, agent_urls: dict[str, str]):
         self._agent_urls = agent_urls
         self._cards: dict[str, dict] = {}
+        self._cards_hash: str = ""
 
-    async def refresh(self):
-        """Fetch Agent Cards from all registered agent URLs in parallel."""
+    def _hash(self, cards: dict[str, dict]) -> str:
+        """Stable MD5 of the full cards dict for change detection."""
+        return hashlib.md5(json.dumps(cards, sort_keys=True).encode()).hexdigest()
+
+    async def refresh(self) -> bool:
+        """Fetch Agent Cards from all registered agent URLs in parallel.
+
+        Returns:
+            True if cards changed since the last refresh, False if unchanged.
+        """
         logger.info("Refreshing agent cards from %d agent(s)", len(self._agent_urls))
-        self._cards = {}
+        new_cards: dict[str, dict] = {}
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             async def _fetch(agent_id: str, base_url: str) -> tuple[str, dict | None]:
@@ -44,10 +55,22 @@ class AgentRegistry:
 
         for agent_id, card in results:
             if card is not None:
-                self._cards[agent_id] = card
+                new_cards[agent_id] = card
 
-        logger.info("Registry refreshed — %d/%d agents available",
-                     len(self._cards), len(self._agent_urls))
+        new_hash = self._hash(new_cards)
+        if new_hash == self._cards_hash:
+            logger.info(
+                "Agent cards unchanged (hash=%s) — skipping re-index", new_hash[:8]
+            )
+            return False
+
+        self._cards = new_cards
+        self._cards_hash = new_hash
+        logger.info(
+            "Registry refreshed — %d/%d agents available (hash=%s)",
+            len(self._cards), len(self._agent_urls), new_hash[:8],
+        )
+        return True
 
     def get_cards(self) -> dict[str, dict]:
         return dict(self._cards)
