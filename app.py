@@ -155,14 +155,14 @@ class DirectQueryResponse(BaseModel):
 
 @app.post("/query", response_model=QueryResponse)
 @limiter.limit("30/minute")
-async def query(http_request: Request, request: QueryRequest):
+async def query(request: Request, body: QueryRequest):
     """Route a query to the best agent via embedding-based routing."""
-    logger.info("POST /query — query='%s'", request.query[:100])
+    logger.info("POST /query — query='%s'", body.query[:100])
 
     if not registry.get_cards():
         raise HTTPException(status_code=503, detail="No agents available. Try POST /agents/refresh.")
 
-    decision = await router.route(request.query)
+    decision = await router.route(body.query)
 
     agent_url = registry.get_url(decision.agent_name)
     if not agent_url:
@@ -171,10 +171,10 @@ async def query(http_request: Request, request: QueryRequest):
             detail=f"Agent '{decision.agent_name}' not found. Available: {list(registry.get_cards().keys())}",
         )
 
-    response_text = await caller.call_agent(agent_url, request.query, request.session_id)
+    response_text = await caller.call_agent(agent_url, body.query, body.session_id)
 
     return QueryResponse(
-        query=request.query,
+        query=body.query,
         routed_to=decision.agent_name,
         reasoning=decision.reasoning,
         response=response_text,
@@ -183,9 +183,9 @@ async def query(http_request: Request, request: QueryRequest):
 
 @app.post("/agents/{agent_id}/query", response_model=DirectQueryResponse)
 @limiter.limit("30/minute")
-async def direct_query(agent_id: str, http_request: Request, request: DirectQueryRequest):
+async def direct_query(agent_id: str, request: Request, body: DirectQueryRequest):
     """Call a specific agent directly via A2A, bypassing the router."""
-    logger.info("POST /agents/%s/query — query='%s'", agent_id, request.query[:100])
+    logger.info("POST /agents/%s/query — query='%s'", agent_id, body.query[:100])
 
     agent_url = registry.get_url(agent_id)
     if not agent_url:
@@ -194,20 +194,20 @@ async def direct_query(agent_id: str, http_request: Request, request: DirectQuer
             detail=f"Agent '{agent_id}' not found. Available: {list(AGENT_URLS.keys())}",
         )
 
-    response_text = await caller.call_agent(agent_url, request.query, request.session_id)
+    response_text = await caller.call_agent(agent_url, body.query, body.session_id)
 
     return DirectQueryResponse(
         agent_id=agent_id,
-        query=request.query,
+        query=body.query,
         response=response_text,
     )
 
 
 @app.post("/agents/{agent_id}/query/stream")
 @limiter.limit("30/minute")
-async def direct_query_stream(agent_id: str, request: DirectQueryRequest, http_request: Request):
+async def direct_query_stream(agent_id: str, body: DirectQueryRequest, request: Request):
     """Stream a response from a specific agent, bypassing the router."""
-    logger.info("POST /agents/%s/query/stream — query='%s'", agent_id, request.query[:100])
+    logger.info("POST /agents/%s/query/stream — query='%s'", agent_id, body.query[:100])
 
     agent_url = registry.get_url(agent_id)
     if not agent_url:
@@ -216,13 +216,13 @@ async def direct_query_stream(agent_id: str, request: DirectQueryRequest, http_r
             detail=f"Agent '{agent_id}' not found. Available: {list(AGENT_URLS.keys())}",
         )
 
-    raw = http_request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
     user_id = _decode_token(raw) if raw else None
 
     async def event_stream():
-        async for chunk in caller.stream_agent(agent_url, request.query, request.session_id,
-                                               response_format=request.response_format,
-                                               model_id=request.model_id,
+        async for chunk in caller.stream_agent(agent_url, body.query, body.session_id,
+                                               response_format=body.response_format,
+                                               model_id=body.model_id,
                                                user_id=user_id):
             yield f"data: {json.dumps({'text': chunk})}\n\n"
         yield "data: [DONE]\n\n"
@@ -232,19 +232,19 @@ async def direct_query_stream(agent_id: str, request: DirectQueryRequest, http_r
 
 @app.post("/query/stream")
 @limiter.limit("30/minute")
-async def query_stream(request: QueryRequest, http_request: Request):
+async def query_stream(body: QueryRequest, request: Request):
     """Route a query to the best agent and stream the response as SSE.
 
     Uses the agent's /ask/stream endpoint directly for real-time streaming.
     Each SSE event contains {"text": "..."} with a token chunk.
     The stream ends with a [DONE] sentinel.
     """
-    logger.info("POST /query/stream — query='%s'", request.query[:100])
+    logger.info("POST /query/stream — query='%s'", body.query[:100])
 
     if not registry.get_cards():
         raise HTTPException(status_code=503, detail="No agents available. Try POST /agents/refresh.")
 
-    decision = await router.route(request.query)
+    decision = await router.route(body.query)
 
     agent_url = registry.get_url(decision.agent_name)
     if not agent_url:
@@ -253,7 +253,7 @@ async def query_stream(request: QueryRequest, http_request: Request):
             detail=f"Agent '{decision.agent_name}' not found. Available: {list(registry.get_cards().keys())}",
         )
 
-    raw = http_request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
     user_id = _decode_token(raw) if raw else None
 
     async def event_stream():
@@ -261,9 +261,9 @@ async def query_stream(request: QueryRequest, http_request: Request):
         yield f"data: {json.dumps({'routed_to': decision.agent_name, 'reasoning': decision.reasoning})}\n\n"
 
         # Proxy the agent's SSE stream
-        async for chunk in caller.stream_agent(agent_url, request.query, request.session_id,
-                                               response_format=request.response_format,
-                                               model_id=request.model_id,
+        async for chunk in caller.stream_agent(agent_url, body.query, body.session_id,
+                                               response_format=body.response_format,
+                                               model_id=body.model_id,
                                                user_id=user_id):
             yield f"data: {json.dumps({'text': chunk})}\n\n"
 
