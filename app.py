@@ -88,7 +88,7 @@ class _JsonFormatter(logging.Formatter):
 
 _handler = logging.StreamHandler()
 _handler.setFormatter(_JsonFormatter())
-logging.root.setLevel(logging.INFO)
+logging.root.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
 logging.root.addHandler(_handler)
 logger = logging.getLogger("marketplace.api")
 limiter = Limiter(key_func=get_remote_address)
