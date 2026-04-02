@@ -5,4 +5,5 @@ AGENT_URLS = {
     "research-agent": os.getenv("RESEARCH_AGENT_URL", "http://localhost:9002"),
     "interview-prep-agent": os.getenv("INTERVIEW_PREP_AGENT_URL", "http://localhost:9003"),
     "news-agent": os.getenv("NEWS_AGENT_URL", "http://localhost:9004"),
+    "health-agent": os.getenv("HEALTH_AGENT_URL", "http://localhost:9005"),
 }
