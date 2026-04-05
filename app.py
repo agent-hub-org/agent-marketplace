@@ -360,8 +360,8 @@ async def refresh_agents():
 
 
 AVAILABLE_MODELS = [
-    {"id": "azure/gpt-4o-mini",      "label": "GPT-4o mini",      "provider": "Azure AI Foundry"},
-    {"id": "azure/gpt-4.1-mini",     "label": "GPT-4.1 mini",     "provider": "Azure AI Foundry"},
+    {"id": "azure/gpt-5-nano",      "label": "GPT-5 nano",      "provider": "Azure AI Foundry"},
+    {"id": "azure/gpt-5.4-nano",     "label": "GPT-5.4 nano",     "provider": "Azure AI Foundry"},
     {"id": "azure/llama-4-maverick", "label": "Llama 4 Maverick", "provider": "Azure AI Foundry"},
     {
         "id": "azure/gpt-oss-120b",
