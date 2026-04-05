@@ -6,6 +6,19 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger("marketplace.router")
 
+_MIN_ROUTING_CONFIDENCE = 0.25
+
+
+class LowConfidenceError(Exception):
+    """Raised when no agent matches the query with sufficient confidence."""
+    def __init__(self, best_score: float, best_agent: str):
+        self.best_score = best_score
+        self.best_agent = best_agent
+        super().__init__(
+            f"No agent matched with sufficient confidence "
+            f"(best: '{best_agent}' @ {best_score:.3f}, threshold: {_MIN_ROUTING_CONFIDENCE})"
+        )
+
 
 class RoutingDecision(BaseModel):
     """Structured output for routing decisions."""
@@ -65,6 +78,13 @@ class EmbeddingRouter:
             if score > best_score:
                 best_score = score
                 best_agent = agent_id
+
+        if best_score < _MIN_ROUTING_CONFIDENCE:
+            logger.warning(
+                "Low-confidence routing: best agent='%s', score=%.3f (threshold=%.2f) — rejecting",
+                best_agent, best_score, _MIN_ROUTING_CONFIDENCE,
+            )
+            raise LowConfidenceError(best_score=best_score, best_agent=best_agent)
 
         reasoning = (
             f"Matched '{best_agent}' with similarity {best_score:.3f} "

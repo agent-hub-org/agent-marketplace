@@ -8,6 +8,28 @@ import httpx
 logger = logging.getLogger("marketplace.registry")
 
 
+def _validate_card(agent_id: str, card: dict) -> bool:
+    """Validate that an agent card has the required fields for routing."""
+    for field in ("name", "description"):
+        if not card.get(field):
+            logger.error(
+                "Agent card for '%s' rejected: missing or empty required field '%s'",
+                agent_id, field,
+            )
+            return False
+    skills = card.get("skills", [])
+    if not isinstance(skills, list):
+        logger.error("Agent card for '%s' rejected: 'skills' must be a list", agent_id)
+        return False
+    for i, skill in enumerate(skills):
+        if not isinstance(skill, dict) or not skill.get("name") or not skill.get("description"):
+            logger.warning(
+                "Agent card for '%s' skill[%d] is missing 'name' or 'description' — skipping skill",
+                agent_id, i,
+            )
+    return True
+
+
 class AgentRegistry:
     """Fetches and caches Agent Cards from registered A2A agents."""
 
@@ -54,7 +76,7 @@ class AgentRegistry:
             )
 
         for agent_id, card in results:
-            if card is not None:
+            if card is not None and _validate_card(agent_id, card):
                 new_cards[agent_id] = card
 
         new_hash = self._hash(new_cards)

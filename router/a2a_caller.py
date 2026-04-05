@@ -160,16 +160,32 @@ class AgentCaller:
 
         async with self._client.stream("POST", stream_url, json=payload, headers=headers) as response:
             response.raise_for_status()
+            current_event_type = "message"
             async for line in response.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    data = line[6:]  # strip "data: " prefix
-                    if data == "[DONE]":
-                        return
+                if line.startswith("event: "):
+                    current_event_type = line[7:].strip()
+                    continue
+                if line == "":
+                    current_event_type = "message"
+                    continue
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:]  # strip "data: " prefix
+                if data == "[DONE]":
+                    return
+                if current_event_type == "progress":
                     try:
                         parsed = json.loads(data)
-                        if "text" in parsed:
-                            yield parsed["text"]
-                        # Skip session_id metadata — it's internal, not user-facing content
+                        if "phase" in parsed:
+                            yield f"__PROGRESS__:{parsed['phase']}"
                     except json.JSONDecodeError:
-                        continue
+                        pass
+                    current_event_type = "message"
+                    continue
+                try:
+                    parsed = json.loads(data)
+                    if "text" in parsed:
+                        yield parsed["text"]
+                    # Skip session_id metadata — it's internal, not user-facing content
+                except json.JSONDecodeError:
+                    continue

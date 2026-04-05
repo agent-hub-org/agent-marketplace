@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -29,8 +30,27 @@ _auth_client: AsyncIOMotorClient | None = None
 def _users_collection():
     global _auth_client
     if _auth_client is None:
-        _auth_client = AsyncIOMotorClient(_MONGO_URI)
+        _auth_client = AsyncIOMotorClient(
+            _MONGO_URI,
+            serverSelectionTimeoutMS=5000,
+            socketTimeoutMS=30000,
+        )
     return _auth_client["agent_auth"]["users"]
+
+
+def _refresh_tokens_collection():
+    global _auth_client
+    if _auth_client is None:
+        _auth_client = AsyncIOMotorClient(
+            _MONGO_URI,
+            serverSelectionTimeoutMS=5000,
+            socketTimeoutMS=30000,
+        )
+    return _auth_client["agent_auth"]["refresh_tokens"]
+
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
 
 _JWT_SECRET = os.getenv("AUTH_JWT_SECRET")
 if not _JWT_SECRET:
@@ -73,7 +93,7 @@ def _decode_refresh_token(token: str) -> str | None:
 
 from config import AGENT_URLS
 from router.registry import AgentRegistry
-from router.router_agent import EmbeddingRouter
+from router.router_agent import EmbeddingRouter, LowConfidenceError
 from router.a2a_caller import AgentCaller
 
 load_dotenv()
@@ -95,7 +115,18 @@ _handler.setFormatter(_JsonFormatter())
 logging.root.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
 logging.root.addHandler(_handler)
 logger = logging.getLogger("marketplace.api")
-limiter = Limiter(key_func=get_remote_address)
+
+
+def _get_rate_limit_key(request: Request) -> str:
+    """Rate-limit by user_id when authenticated, fall back to IP."""
+    raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    user_id = _decode_token(raw) if raw else None
+    if user_id:
+        return f"user:{user_id}"
+    return get_remote_address(request)
+
+
+limiter = Limiter(key_func=_get_rate_limit_key)
 
 class _RequestIDMiddleware(BaseHTTPMiddleware):
     """Generate or propagate X-Request-ID for every request."""
@@ -116,6 +147,8 @@ caller = AgentCaller()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await _users_collection().create_index("email", unique=True)
+    await _refresh_tokens_collection().create_index("token_hash", unique=True)
+    await _refresh_tokens_collection().create_index("expires_at", expireAfterSeconds=0)
     await registry.refresh()
     await router.build_index(registry.get_cards())
     logger.info("Marketplace started — %d agent(s) registered", len(registry.get_cards()))
@@ -194,7 +227,16 @@ async def query(request: Request, body: QueryRequest):
     if not registry.get_cards():
         raise HTTPException(status_code=503, detail="No agents available. Try POST /agents/refresh.")
 
-    decision = await router.route(body.query)
+    try:
+        decision = await router.route(body.query)
+    except LowConfidenceError as e:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Your query doesn't clearly match any available agent (best match: '{e.best_agent}', "
+                f"confidence: {e.best_score:.2f}). Try rephrasing or be more specific."
+            ),
+        )
 
     raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
     user_id = _decode_token(raw) if raw else None
@@ -288,7 +330,11 @@ async def direct_query_stream(agent_id: str, body: DirectQueryRequest, request: 
                                                request_id=_request_id,
                                                watchlist_id=body.watchlist_id,
                                                as_of_date=body.as_of_date):
-            yield f"data: {json.dumps({'text': chunk})}\n\n"
+            if chunk.startswith("__PROGRESS__:"):
+                phase = chunk[len("__PROGRESS__:"):]
+                yield f"event: progress\ndata: {json.dumps({'phase': phase})}\n\n"
+            else:
+                yield f"data: {json.dumps({'text': chunk})}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -308,7 +354,16 @@ async def query_stream(body: QueryRequest, request: Request):
     if not registry.get_cards():
         raise HTTPException(status_code=503, detail="No agents available. Try POST /agents/refresh.")
 
-    decision = await router.route(body.query)
+    try:
+        decision = await router.route(body.query)
+    except LowConfidenceError as e:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Your query doesn't clearly match any available agent (best match: '{e.best_agent}', "
+                f"confidence: {e.best_score:.2f}). Try rephrasing or be more specific."
+            ),
+        )
 
     agent_url = registry.get_url(decision.agent_name)
     if not agent_url:
@@ -333,7 +388,11 @@ async def query_stream(body: QueryRequest, request: Request):
                                                request_id=_request_id,
                                                watchlist_id=body.watchlist_id,
                                                as_of_date=body.as_of_date):
-            yield f"data: {json.dumps({'text': chunk})}\n\n"
+            if chunk.startswith("__PROGRESS__:"):
+                phase = chunk[len("__PROGRESS__:"):]
+                yield f"event: progress\ndata: {json.dumps({'phase': phase})}\n\n"
+            else:
+                yield f"data: {json.dumps({'text': chunk})}\n\n"
 
         yield "data: [DONE]\n\n"
 
@@ -555,6 +614,22 @@ class LoginRequest(BaseModel):
     password: str
 
 
+async def _store_refresh_token(user_id: str, token: str) -> None:
+    """Persist a hashed refresh token so it can be rotated and revoked."""
+    expire = datetime.now(timezone.utc) + timedelta(days=7)
+    await _refresh_tokens_collection().insert_one({
+        "token_hash": _hash_token(token),
+        "user_id": user_id,
+        "expires_at": expire,
+    })
+
+
+async def _revoke_refresh_token(token: str) -> bool:
+    """Delete a refresh token from the DB. Returns True if it existed."""
+    result = await _refresh_tokens_collection().delete_one({"token_hash": _hash_token(token)})
+    return result.deleted_count > 0
+
+
 @app.post("/auth/register")
 @limiter.limit("10/minute")
 async def register(request: Request, body: RegisterRequest):
@@ -569,12 +644,14 @@ async def register(request: Request, body: RegisterRequest):
         "password_hash": bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode(),
         "created_at": datetime.now(timezone.utc),
     })
+    refresh = _create_refresh_token(user_id)
+    await _store_refresh_token(user_id, refresh)
     logger.info("Registered user email='%s'", email)
     return {
         "user_id": user_id,
         "email": email,
         "token": _create_access_token(user_id),
-        "refresh_token": _create_refresh_token(user_id),
+        "refresh_token": refresh,
     }
 
 
@@ -585,16 +662,22 @@ async def login(request: Request, body: LoginRequest):
     user = await col.find_one({"email": body.email.lower().strip()}, {"_id": 0})
     if not user or not bcrypt.checkpw(body.password.encode(), user["password_hash"].encode()):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
+    refresh = _create_refresh_token(user["user_id"])
+    await _store_refresh_token(user["user_id"], refresh)
     logger.info("Login user='%s'", user["user_id"])
     return {
         "user_id": user["user_id"],
         "email": user["email"],
         "token": _create_access_token(user["user_id"]),
-        "refresh_token": _create_refresh_token(user["user_id"]),
+        "refresh_token": refresh,
     }
 
 
 class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class LogoutRequest(BaseModel):
     refresh_token: str
 
 
@@ -604,11 +687,28 @@ async def refresh_token_endpoint(request: Request, body: RefreshRequest):
     user_id = _decode_refresh_token(body.refresh_token)
     if not user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired refresh token")
-    logger.info("Token refresh for user='%s'", user_id)
+    existed = await _revoke_refresh_token(body.refresh_token)
+    if not existed:
+        # Token was not in DB — either already used (replay) or from before rotation was added
+        logger.warning("Refresh token not found in DB for user='%s' — possible replay attack", user_id)
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token already used or revoked")
+    new_refresh = _create_refresh_token(user_id)
+    await _store_refresh_token(user_id, new_refresh)
+    logger.info("Token rotated for user='%s'", user_id)
     return {
         "token": _create_access_token(user_id),
-        "refresh_token": _create_refresh_token(user_id),
+        "refresh_token": new_refresh,
     }
+
+
+@app.post("/auth/logout")
+async def logout(request: Request, body: LogoutRequest):
+    """Revoke the refresh token so it cannot be reused after logout."""
+    user_id = _decode_refresh_token(body.refresh_token)
+    if user_id:
+        await _revoke_refresh_token(body.refresh_token)
+        logger.info("Logout — refresh token revoked for user='%s'", user_id)
+    return {"status": "logged_out"}
 
 
 @app.get("/agents/{agent_id}/history/me")
