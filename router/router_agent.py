@@ -34,13 +34,18 @@ class EmbeddingRouter:
     """
 
     def __init__(self):
-        self._embeddings = OpenAIEmbeddings(
-            base_url=os.environ["AZURE_AI_FOUNDRY_ENDPOINT"],
-            api_key=os.environ["AZURE_AI_FOUNDRY_API_KEY"],
-            model="text-embedding-3-small",
-        )
+        self._embeddings: OpenAIEmbeddings | None = None
         self._agent_embeddings: dict[str, list[float]] = {}
         self._agent_descriptions: dict[str, str] = {}
+
+    def _get_embeddings(self) -> OpenAIEmbeddings:
+        if self._embeddings is None:
+            self._embeddings = OpenAIEmbeddings(
+                base_url=os.environ["AZURE_AI_FOUNDRY_ENDPOINT"],
+                api_key=os.environ["AZURE_AI_FOUNDRY_API_KEY"],
+                model="text-embedding-3-small",
+            )
+        return self._embeddings
 
     async def build_index(self, cards: dict[str, dict]) -> None:
         """Compute and cache unit-vector embeddings for all agent descriptions + skills.
@@ -60,7 +65,7 @@ class EmbeddingRouter:
 
         texts = list(self._agent_descriptions.values())
         agent_ids = list(self._agent_descriptions.keys())
-        embeddings = await self._embeddings.aembed_documents(texts)
+        embeddings = await self._get_embeddings().aembed_documents(texts)
 
         for agent_id, embedding in zip(agent_ids, embeddings):
             # Store as unit vector — dot(unit_a, unit_b) == cosine_similarity(a, b)
@@ -74,7 +79,7 @@ class EmbeddingRouter:
         if not self._agent_embeddings:
             raise ValueError("No agents indexed. Call build_index() first.")
 
-        raw_query_embedding = await self._embeddings.aembed_query(query)
+        raw_query_embedding = await self._get_embeddings().aembed_query(query)
         # Normalise query embedding to unit vector for pure dot-product similarity
         qnorm = sum(x * x for x in raw_query_embedding) ** 0.5
         query_embedding = [x / qnorm for x in raw_query_embedding] if qnorm > 0 else raw_query_embedding
