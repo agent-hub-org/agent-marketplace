@@ -22,6 +22,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
 
 import httpx
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 _MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 _auth_client: AsyncIOMotorClient | None = None
@@ -156,6 +157,9 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 if os.getenv("HTTPS_REDIRECT", "").lower() == "true":
     app.add_middleware(HTTPSRedirectMiddleware)
+
+# Trust headers from Cloudflare Proxy
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
 _raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:5173")
 _allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
