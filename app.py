@@ -725,9 +725,9 @@ async def logout(request: Request, body: LogoutRequest):
 
 @app.get("/agents/{agent_id}/history/me")
 @limiter.limit("60/minute")
-async def proxy_history(agent_id: str, http_request: Request):
+async def proxy_history(agent_id: str, request: Request):
     """Verify JWT here, then forward user_id to the agent via X-User-Id header."""
-    raw = http_request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
     user_id = _decode_token(raw) if raw else None
     if not user_id:
         raise HTTPException(status_code=401, detail="Authentication required")
