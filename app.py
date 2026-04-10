@@ -176,7 +176,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Internal-API-Key", "X-User-Id", "X-Request-ID"],
 )
 app.add_middleware(_RequestIDMiddleware)
@@ -567,6 +567,22 @@ async def proxy_list_watchlists(agent_id: str, request: Request):
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     return resp.json()
 
+@app.get("/agents/{agent_id}/watchlists/{watchlist_id}/performance")
+async def proxy_watchlist_performance(agent_id: str, watchlist_id: str, request: Request):
+    agent_url = registry.get_url(agent_id)
+    if not agent_url:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
+    raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    user_id = _decode_token(raw) if raw else None
+    async with httpx.AsyncClient(headers=_INTERNAL_HEADERS, timeout=30.0) as client:
+        resp = await client.get(
+            f"{agent_url}/watchlists/{watchlist_id}/performance",
+            headers={"X-User-Id": user_id} if user_id else {},
+        )
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()
+
 @app.get("/agents/{agent_id}/watchlists/{watchlist_id}")
 async def proxy_get_watchlist(agent_id: str, watchlist_id: str, request: Request):
     agent_url = registry.get_url(agent_id)
@@ -615,6 +631,54 @@ async def proxy_delete_watchlist(agent_id: str, watchlist_id: str, request: Requ
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     return {"success": True}
+
+
+# ── Profile proxy endpoints ──
+
+@app.get("/agents/{agent_id}/profile/onboard/start")
+async def proxy_onboard_start(agent_id: str):
+    agent_url = registry.get_url(agent_id)
+    if not agent_url:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
+    async with httpx.AsyncClient(headers=_INTERNAL_HEADERS, timeout=10.0) as client:
+        resp = await client.get(f"{agent_url}/profile/onboard/start")
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()
+
+@app.get("/agents/{agent_id}/profile")
+async def proxy_get_profile(agent_id: str, request: Request):
+    agent_url = registry.get_url(agent_id)
+    if not agent_url:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
+    raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    user_id = _decode_token(raw) if raw else None
+    async with httpx.AsyncClient(headers=_INTERNAL_HEADERS, timeout=10.0) as client:
+        resp = await client.get(
+            f"{agent_url}/profile",
+            headers={"X-User-Id": user_id} if user_id else {},
+        )
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()
+
+@app.put("/agents/{agent_id}/profile")
+async def proxy_upsert_profile(agent_id: str, request: Request):
+    agent_url = registry.get_url(agent_id)
+    if not agent_url:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
+    raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    user_id = _decode_token(raw) if raw else None
+    body = await request.json()
+    async with httpx.AsyncClient(headers=_INTERNAL_HEADERS, timeout=10.0) as client:
+        resp = await client.put(
+            f"{agent_url}/profile",
+            json=body,
+            headers={"X-User-Id": user_id} if user_id else {},
+        )
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()
 
 
 def _parse_error(resp) -> str:
