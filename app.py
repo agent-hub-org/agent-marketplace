@@ -349,37 +349,64 @@ async def direct_query_stream(agent_id: str, body: DirectQueryRequest, request: 
     _request_id = request.state.request_id
 
     async def event_stream():
+        queue = asyncio.Queue()
+        _HEARTBEAT_INTERVAL = 15.0
+
+        async def heartbeat_worker():
+            try:
+                while True:
+                    await asyncio.sleep(_HEARTBEAT_INTERVAL)
+                    await queue.put(f": heartbeat {int(asyncio.get_event_loop().time())}\n\n")
+            except asyncio.CancelledError:
+                pass
+
+        async def agent_worker():
+            try:
+                if supports_streaming:
+                    async for chunk in caller.stream_agent(agent_url, body.query, body.session_id,
+                                                           response_format=body.response_format,
+                                                           model_id=body.model_id,
+                                                           user_id=user_id,
+                                                           request_id=_request_id,
+                                                           watchlist_id=body.watchlist_id,
+                                                           as_of_date=body.as_of_date):
+                        await queue.put(chunk)
+                else:
+                    response_text = await caller.call_agent(
+                        agent_url, body.query, body.session_id, user_id=user_id,
+                        request_id=_request_id,
+                        watchlist_id=body.watchlist_id, as_of_date=body.as_of_date,
+                    )
+                    await queue.put(response_text)
+            except Exception as e:
+                logger.error("Stream error for agent '%s': %s", agent_id, e, exc_info=True)
+                await queue.put("__ERROR__:An error occurred while communicating with the agent. Please try again.")
+            finally:
+                await queue.put(None)
+
+        heartbeat_task = asyncio.create_task(heartbeat_worker())
+        agent_task = asyncio.create_task(agent_worker())
+
         try:
-            if supports_streaming:
-                async for chunk in caller.stream_agent(agent_url, body.query, body.session_id,
-                                                       response_format=body.response_format,
-                                                       model_id=body.model_id,
-                                                       user_id=user_id,
-                                                       request_id=_request_id,
-                                                       watchlist_id=body.watchlist_id,
-                                                       as_of_date=body.as_of_date):
-                    if chunk.startswith("__PROGRESS__:"):
-                        phase = chunk[len("__PROGRESS__:"):]
-                        yield f"event: progress\ndata: {json.dumps({'phase': phase})}\n\n"
-                    elif chunk.startswith("__ERROR__:"):
-                        error_msg = chunk[len("__ERROR__:"):]
-                        yield f"event: error\ndata: {json.dumps({'message': error_msg})}\n\n"
-                        yield f"data: {json.dumps({'text': error_msg})}\n\n"
-                    else:
-                        yield f"data: {json.dumps({'text': chunk})}\n\n"
-            else:
-                response_text = await caller.call_agent(
-                    agent_url, body.query, body.session_id, user_id=user_id,
-                    request_id=_request_id,
-                    watchlist_id=body.watchlist_id, as_of_date=body.as_of_date,
-                )
-                yield f"data: {json.dumps({'text': response_text})}\n\n"
-        except Exception as e:
-            logger.error("Stream error for agent '%s': %s", agent_id, e, exc_info=True)
-            error_msg = "An error occurred while communicating with the agent. Please try again."
-            yield f"event: error\ndata: {json.dumps({'message': error_msg})}\n\n"
-            yield f"data: {json.dumps({'text': error_msg})}\n\n"
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
+
+                if chunk.startswith(": heartbeat"):
+                    yield chunk
+                elif chunk.startswith("__PROGRESS__:"):
+                    phase = chunk[len("__PROGRESS__:"):]
+                    yield f"event: progress\ndata: {json.dumps({'phase': phase})}\n\n"
+                elif chunk.startswith("__ERROR__:"):
+                    error_msg = chunk[len("__ERROR__:"):]
+                    yield f"event: error\ndata: {json.dumps({'message': error_msg})}\n\n"
+                    yield f"data: {json.dumps({'text': error_msg})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'text': chunk})}\n\n"
         finally:
+            heartbeat_task.cancel()
+            await agent_task
             yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -426,41 +453,68 @@ async def query_stream(body: QueryRequest, request: Request):
 
     _request_id = request.state.request_id
     async def event_stream():
-        # Send routing metadata as the first event
+        queue = asyncio.Queue()
+        _HEARTBEAT_INTERVAL = 15.0
+
+        async def heartbeat_worker():
+            try:
+                while True:
+                    await asyncio.sleep(_HEARTBEAT_INTERVAL)
+                    await queue.put(f": heartbeat {int(asyncio.get_event_loop().time())}\n\n")
+            except asyncio.CancelledError:
+                pass
+
+        async def agent_worker():
+            try:
+                if supports_streaming:
+                    async for chunk in caller.stream_agent(agent_url, body.query, body.session_id,
+                                                           response_format=body.response_format,
+                                                           model_id=body.model_id,
+                                                           user_id=user_id,
+                                                           request_id=_request_id,
+                                                           watchlist_id=body.watchlist_id,
+                                                           as_of_date=body.as_of_date):
+                        await queue.put(chunk)
+                else:
+                    response_text = await caller.call_agent(
+                        agent_url, body.query, body.session_id, user_id=user_id,
+                        mode=agent_card.get("metadata", {}).get("mode") if agent_card else None,
+                        request_id=_request_id,
+                        watchlist_id=body.watchlist_id, as_of_date=body.as_of_date,
+                    )
+                    await queue.put(response_text)
+            except Exception as e:
+                logger.error("Stream error for agent '%s': %s", decision.agent_name, e, exc_info=True)
+                await queue.put("__ERROR__:An error occurred while communicating with the agent. Please try again.")
+            finally:
+                await queue.put(None)
+
+        # Send routing metadata as the first event directly
         yield f"data: {json.dumps({'routed_to': decision.agent_name, 'reasoning': decision.reasoning})}\n\n"
 
+        heartbeat_task = asyncio.create_task(heartbeat_worker())
+        agent_task = asyncio.create_task(agent_worker())
+
         try:
-            if supports_streaming:
-                async for chunk in caller.stream_agent(agent_url, body.query, body.session_id,
-                                                       response_format=body.response_format,
-                                                       model_id=body.model_id,
-                                                       user_id=user_id,
-                                                       request_id=_request_id,
-                                                       watchlist_id=body.watchlist_id,
-                                                       as_of_date=body.as_of_date):
-                    if chunk.startswith("__PROGRESS__:"):
-                        phase = chunk[len("__PROGRESS__:"):]
-                        yield f"event: progress\ndata: {json.dumps({'phase': phase})}\n\n"
-                    elif chunk.startswith("__ERROR__:"):
-                        error_msg = chunk[len("__ERROR__:"):]
-                        yield f"event: error\ndata: {json.dumps({'message': error_msg})}\n\n"
-                        yield f"data: {json.dumps({'text': error_msg})}\n\n"
-                    else:
-                        yield f"data: {json.dumps({'text': chunk})}\n\n"
-            else:
-                response_text = await caller.call_agent(
-                    agent_url, body.query, body.session_id, user_id=user_id,
-                    mode=agent_card.get("metadata", {}).get("mode") if agent_card else None,
-                    request_id=_request_id,
-                    watchlist_id=body.watchlist_id, as_of_date=body.as_of_date,
-                )
-                yield f"data: {json.dumps({'text': response_text})}\n\n"
-        except Exception as e:
-            logger.error("Stream error for agent '%s': %s", decision.agent_name, e, exc_info=True)
-            error_msg = "An error occurred while communicating with the agent. Please try again."
-            yield f"event: error\ndata: {json.dumps({'message': error_msg})}\n\n"
-            yield f"data: {json.dumps({'text': error_msg})}\n\n"
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
+
+                if chunk.startswith(": heartbeat"):
+                    yield chunk
+                elif chunk.startswith("__PROGRESS__:"):
+                    phase = chunk[len("__PROGRESS__:"):]
+                    yield f"event: progress\ndata: {json.dumps({'phase': phase})}\n\n"
+                elif chunk.startswith("__ERROR__:"):
+                    error_msg = chunk[len("__ERROR__:"):]
+                    yield f"event: error\ndata: {json.dumps({'message': error_msg})}\n\n"
+                    yield f"data: {json.dumps({'text': error_msg})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'text': chunk})}\n\n"
         finally:
+            heartbeat_task.cancel()
+            await agent_task
             yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
