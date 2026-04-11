@@ -195,14 +195,20 @@ class AgentCaller:
                     parsed = json.loads(data)
                     if not isinstance(parsed, dict):
                         continue
+                        
+                    # A2A responses are JSON-RPC 2.0. Extract the result object.
+                    result_obj = parsed.get("result", {})
+                    if not isinstance(result_obj, dict):
+                        continue
+
                     # A2A artifact-update event: extract text from parts
-                    if parsed.get("kind") == "artifact-update":
-                        for part in parsed.get("artifact", {}).get("parts", []):
+                    if result_obj.get("kind") == "artifact-update":
+                        for part in result_obj.get("artifact", {}).get("parts", []):
                             if part.get("kind") == "text" and part.get("text"):
                                 yield part["text"]
                     # status-update: handle failed or final states
-                    elif parsed.get("kind") == "status-update":
-                        status = parsed.get("status", {})
+                    elif result_obj.get("kind") == "status-update":
+                        status = result_obj.get("status", {})
                         state = status.get("state") if isinstance(status, dict) else None
                         if state == "failed":
                             error_msg = "The agent failed to process your request. Please try again."
@@ -211,7 +217,7 @@ class AgentCaller:
                                 error_msg = msg_obj["text"]
                             yield f"__ERROR__:{error_msg}"
                             return
-                        elif parsed.get("final"):
+                        elif result_obj.get("final"):
                             return
                 except json.JSONDecodeError:
                     pass
