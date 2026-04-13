@@ -115,10 +115,26 @@ configure_logging("marketplace")
 logger = logging.getLogger("marketplace.api")
 
 
+class _JWTDecodeMiddleware(BaseHTTPMiddleware):
+    """Decode the Bearer JWT once per request and cache result in request.state.
+
+    Both the rate limiter key function and endpoint handlers read from
+    request.state.user_id, avoiding redundant cryptographic verification.
+    """
+
+    async def dispatch(self, request, call_next):
+        raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+        request.state.user_id = _decode_token(raw) if raw else None
+        return await call_next(request)
+
+
 def _get_rate_limit_key(request: Request) -> str:
-    """Rate-limit by user_id when authenticated, fall back to IP."""
-    raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-    user_id = _decode_token(raw) if raw else None
+    """Rate-limit by user_id when authenticated, fall back to IP.
+
+    Reads from request.state.user_id set by _JWTDecodeMiddleware — no redundant
+    JWT verification on every request.
+    """
+    user_id = getattr(request.state, "user_id", None)
     if user_id:
         return f"user:{user_id}"
     return get_remote_address(request)
@@ -141,9 +157,15 @@ registry = AgentRegistry(AGENT_URLS)
 router = EmbeddingRouter()
 caller = AgentCaller()
 
+# Persistent proxy client — reused across all proxy endpoints to avoid TCP/TLS
+# handshake overhead on every request. Initialized in lifespan, closed on shutdown.
+_proxy_client: httpx.AsyncClient | None = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _proxy_client
+    _proxy_client = httpx.AsyncClient(headers=_INTERNAL_HEADERS, timeout=120.0)
     await _users_collection().create_index("email", unique=True)
     await _refresh_tokens_collection().create_index("token_hash", unique=True)
     await _refresh_tokens_collection().create_index("expires_at", expireAfterSeconds=0)
@@ -152,6 +174,7 @@ async def lifespan(app: FastAPI):
     logger.info("Marketplace started — %d agent(s) registered", len(registry.get_cards()))
     yield
     await caller.close()
+    await _proxy_client.aclose()
     logger.info("Marketplace shutdown")
 
 
@@ -181,6 +204,9 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization", "X-Internal-API-Key", "X-User-Id", "X-Request-ID"],
 )
 app.add_middleware(_RequestIDMiddleware)
+# JWT decode middleware runs innermost (last added = first executed in Starlette)
+# so request.state.user_id is populated before rate limiter key_func and endpoint handlers run.
+app.add_middleware(_JWTDecodeMiddleware)
 
 
 class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -251,8 +277,7 @@ async def query(request: Request, body: QueryRequest):
             ),
         )
 
-    raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-    user_id = _decode_token(raw) if raw else None
+    user_id = request.state.user_id
 
     # Determine mode from agent card metadata
     agent_card = registry.get_card(decision.agent_name)
@@ -299,8 +324,7 @@ async def direct_query(agent_id: str, request: Request, body: DirectQueryRequest
             detail=f"Agent '{agent_id}' not found. Available: {list(AGENT_URLS.keys())}",
         )
 
-    raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-    user_id = _decode_token(raw) if raw else None
+    user_id = request.state.user_id
 
     # Determine mode from agent card metadata
     agent_card = registry.get_card(agent_id)
@@ -339,8 +363,7 @@ async def direct_query_stream(agent_id: str, body: DirectQueryRequest, request: 
             detail=f"Agent '{agent_id}' not found. Available: {list(AGENT_URLS.keys())}",
         )
 
-    raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-    user_id = _decode_token(raw) if raw else None
+    user_id = request.state.user_id
 
     agent_card = registry.get_card(agent_id)
     supports_streaming = (
@@ -444,8 +467,7 @@ async def query_stream(body: QueryRequest, request: Request):
             detail=f"Agent '{decision.agent_name}' not found. Available: {list(registry.get_cards().keys())}",
         )
 
-    raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-    user_id = _decode_token(raw) if raw else None
+    user_id = request.state.user_id
 
     agent_card = registry.get_card(decision.agent_name)
     supports_streaming = (
@@ -573,12 +595,12 @@ async def proxy_upload(agent_id: str, upload_type: str, file: UploadFile = File(
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
 
     file_bytes = await file.read()
-    async with httpx.AsyncClient(headers=_INTERNAL_HEADERS, timeout=120.0) as client:
-        resp = await client.post(
-            f"{agent_url}/upload/{upload_type}",
-            files={"file": (file.filename, file_bytes, file.content_type)},
-            data={"session_id": session_id},
-        )
+    resp = await _proxy_client.post(
+        f"{agent_url}/upload/{upload_type}",
+        files={"file": (file.filename, file_bytes, file.content_type)},
+        data={"session_id": session_id},
+        timeout=120.0,
+    )
 
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
@@ -592,8 +614,7 @@ async def proxy_download(agent_id: str, file_id: str):
     if not agent_url:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
 
-    async with httpx.AsyncClient(headers=_INTERNAL_HEADERS, timeout=60.0) as client:
-        resp = await client.get(f"{agent_url}/download/{file_id}")
+    resp = await _proxy_client.get(f"{agent_url}/download/{file_id}", timeout=60.0)
 
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
@@ -612,8 +633,7 @@ async def proxy_list_files(agent_id: str, session_id: str):
     if not agent_url:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
 
-    async with httpx.AsyncClient(headers=_INTERNAL_HEADERS, timeout=30.0) as client:
-        resp = await client.get(f"{agent_url}/files/{session_id}")
+    resp = await _proxy_client.get(f"{agent_url}/files/{session_id}", timeout=30.0)
 
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
@@ -627,8 +647,7 @@ async def proxy_charts(agent_id: str, ticker: str, request: Request):
     if not agent_url:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
     params = dict(request.query_params)
-    async with httpx.AsyncClient(headers=_INTERNAL_HEADERS, timeout=30.0) as client:
-        resp = await client.get(f"{agent_url}/charts/{ticker}", params=params)
+    resp = await _proxy_client.get(f"{agent_url}/charts/{ticker}", params=params, timeout=30.0)
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     return resp.json()
@@ -641,14 +660,13 @@ async def proxy_create_watchlist(agent_id: str, request: Request):
     agent_url = registry.get_url(agent_id)
     if not agent_url:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    
-    raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-    user_id = _decode_token(raw) if raw else None
-    
+    user_id = request.state.user_id
     body = await request.json()
-    async with httpx.AsyncClient(headers=_INTERNAL_HEADERS, timeout=30.0) as client:
-        resp = await client.post(f"{agent_url}/watchlists", json=body, headers={"X-User-Id": user_id} if user_id else {})
-    
+    resp = await _proxy_client.post(
+        f"{agent_url}/watchlists", json=body,
+        headers={"X-User-Id": user_id} if user_id else {},
+        timeout=30.0,
+    )
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     return resp.json()
@@ -658,13 +676,12 @@ async def proxy_list_watchlists(agent_id: str, request: Request):
     agent_url = registry.get_url(agent_id)
     if not agent_url:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    
-    raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-    user_id = _decode_token(raw) if raw else None
-    
-    async with httpx.AsyncClient(headers=_INTERNAL_HEADERS, timeout=30.0) as client:
-        resp = await client.get(f"{agent_url}/watchlists", headers={"X-User-Id": user_id} if user_id else {})
-        
+    user_id = request.state.user_id
+    resp = await _proxy_client.get(
+        f"{agent_url}/watchlists",
+        headers={"X-User-Id": user_id} if user_id else {},
+        timeout=30.0,
+    )
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     return resp.json()
@@ -674,13 +691,12 @@ async def proxy_watchlist_performance(agent_id: str, watchlist_id: str, request:
     agent_url = registry.get_url(agent_id)
     if not agent_url:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-    user_id = _decode_token(raw) if raw else None
-    async with httpx.AsyncClient(headers=_INTERNAL_HEADERS, timeout=30.0) as client:
-        resp = await client.get(
-            f"{agent_url}/watchlists/{watchlist_id}/performance",
-            headers={"X-User-Id": user_id} if user_id else {},
-        )
+    user_id = request.state.user_id
+    resp = await _proxy_client.get(
+        f"{agent_url}/watchlists/{watchlist_id}/performance",
+        headers={"X-User-Id": user_id} if user_id else {},
+        timeout=30.0,
+    )
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     return resp.json()
@@ -690,13 +706,12 @@ async def proxy_get_watchlist(agent_id: str, watchlist_id: str, request: Request
     agent_url = registry.get_url(agent_id)
     if not agent_url:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    
-    raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-    user_id = _decode_token(raw) if raw else None
-    
-    async with httpx.AsyncClient(headers=_INTERNAL_HEADERS, timeout=30.0) as client:
-        resp = await client.get(f"{agent_url}/watchlists/{watchlist_id}", headers={"X-User-Id": user_id} if user_id else {})
-        
+    user_id = request.state.user_id
+    resp = await _proxy_client.get(
+        f"{agent_url}/watchlists/{watchlist_id}",
+        headers={"X-User-Id": user_id} if user_id else {},
+        timeout=30.0,
+    )
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     return resp.json()
@@ -706,14 +721,13 @@ async def proxy_update_watchlist(agent_id: str, watchlist_id: str, request: Requ
     agent_url = registry.get_url(agent_id)
     if not agent_url:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    
-    raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-    user_id = _decode_token(raw) if raw else None
-    
+    user_id = request.state.user_id
     body = await request.json()
-    async with httpx.AsyncClient(headers=_INTERNAL_HEADERS, timeout=30.0) as client:
-        resp = await client.put(f"{agent_url}/watchlists/{watchlist_id}", json=body, headers={"X-User-Id": user_id} if user_id else {})
-        
+    resp = await _proxy_client.put(
+        f"{agent_url}/watchlists/{watchlist_id}", json=body,
+        headers={"X-User-Id": user_id} if user_id else {},
+        timeout=30.0,
+    )
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     return resp.json()
@@ -723,13 +737,12 @@ async def proxy_delete_watchlist(agent_id: str, watchlist_id: str, request: Requ
     agent_url = registry.get_url(agent_id)
     if not agent_url:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    
-    raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-    user_id = _decode_token(raw) if raw else None
-    
-    async with httpx.AsyncClient(headers=_INTERNAL_HEADERS, timeout=30.0) as client:
-        resp = await client.delete(f"{agent_url}/watchlists/{watchlist_id}", headers={"X-User-Id": user_id} if user_id else {})
-        
+    user_id = request.state.user_id
+    resp = await _proxy_client.delete(
+        f"{agent_url}/watchlists/{watchlist_id}",
+        headers={"X-User-Id": user_id} if user_id else {},
+        timeout=30.0,
+    )
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     return {"success": True}
@@ -742,8 +755,7 @@ async def proxy_onboard_start(agent_id: str):
     agent_url = registry.get_url(agent_id)
     if not agent_url:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    async with httpx.AsyncClient(headers=_INTERNAL_HEADERS, timeout=10.0) as client:
-        resp = await client.get(f"{agent_url}/profile/onboard/start")
+    resp = await _proxy_client.get(f"{agent_url}/profile/onboard/start", timeout=10.0)
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     return resp.json()
@@ -753,13 +765,12 @@ async def proxy_get_profile(agent_id: str, request: Request):
     agent_url = registry.get_url(agent_id)
     if not agent_url:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-    user_id = _decode_token(raw) if raw else None
-    async with httpx.AsyncClient(headers=_INTERNAL_HEADERS, timeout=10.0) as client:
-        resp = await client.get(
-            f"{agent_url}/profile",
-            headers={"X-User-Id": user_id} if user_id else {},
-        )
+    user_id = request.state.user_id
+    resp = await _proxy_client.get(
+        f"{agent_url}/profile",
+        headers={"X-User-Id": user_id} if user_id else {},
+        timeout=10.0,
+    )
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     return resp.json()
@@ -769,15 +780,14 @@ async def proxy_upsert_profile(agent_id: str, request: Request):
     agent_url = registry.get_url(agent_id)
     if not agent_url:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-    user_id = _decode_token(raw) if raw else None
+    user_id = request.state.user_id
     body = await request.json()
-    async with httpx.AsyncClient(headers=_INTERNAL_HEADERS, timeout=10.0) as client:
-        resp = await client.put(
-            f"{agent_url}/profile",
-            json=body,
-            headers={"X-User-Id": user_id} if user_id else {},
-        )
+    resp = await _proxy_client.put(
+        f"{agent_url}/profile",
+        json=body,
+        headers={"X-User-Id": user_id} if user_id else {},
+        timeout=10.0,
+    )
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     return resp.json()
@@ -901,16 +911,17 @@ async def logout(request: Request, body: LogoutRequest):
 @limiter.limit("60/minute")
 async def proxy_history(agent_id: str, request: Request):
     """Verify JWT here, then forward user_id to the agent via X-User-Id header."""
-    raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-    user_id = _decode_token(raw) if raw else None
+    user_id = request.state.user_id
     if not user_id:
         raise HTTPException(status_code=401, detail="Authentication required")
     agent_url = registry.get_url(agent_id)
     if not agent_url:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    async with httpx.AsyncClient(headers=_INTERNAL_HEADERS, timeout=30.0) as client:
-        resp = await client.get(f"{agent_url}/history/user/me",
-                                headers={"X-User-Id": user_id})
+    resp = await _proxy_client.get(
+        f"{agent_url}/history/user/me",
+        headers={"X-User-Id": user_id},
+        timeout=30.0,
+    )
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     return resp.json()
@@ -928,8 +939,11 @@ async def proxy_history_sessions(agent_id: str, body: _SessionsBody, request: Re
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
     # Validate session_ids: alphanumeric only, max 64 chars, capped at 20
     safe_ids = [s for s in body.session_ids[:20] if isinstance(s, str) and s.isalnum() and len(s) <= 64]
-    async with httpx.AsyncClient(headers=_INTERNAL_HEADERS, timeout=30.0) as client:
-        resp = await client.post(f"{agent_url}/history/sessions", json={"session_ids": safe_ids})
+    resp = await _proxy_client.post(
+        f"{agent_url}/history/sessions",
+        json={"session_ids": safe_ids},
+        timeout=30.0,
+    )
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     return resp.json()
