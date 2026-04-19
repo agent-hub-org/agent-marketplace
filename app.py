@@ -991,6 +991,105 @@ async def proxy_history_sessions(agent_id: str, body: _SessionsBody, request: Re
     return resp.json()
 
 
+# ── Health agent proxy endpoints ──
+
+@app.get("/agents/{agent_id}/progress")
+async def proxy_get_progress(agent_id: str, request: Request):
+    agent_url = registry.get_url(agent_id)
+    if not agent_url:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
+    user_id = request.state.user_id
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    params = dict(request.query_params)
+    resp = await _proxy_client.get(
+        f"{agent_url}/progress", params=params,
+        headers={"X-User-Id": user_id},
+        timeout=30.0,
+    )
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()
+
+
+@app.get("/agents/{agent_id}/nutrition")
+async def proxy_get_nutrition(agent_id: str, request: Request):
+    agent_url = registry.get_url(agent_id)
+    if not agent_url:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
+    user_id = request.state.user_id
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    params = dict(request.query_params)
+    resp = await _proxy_client.get(
+        f"{agent_url}/nutrition", params=params,
+        headers={"X-User-Id": user_id},
+        timeout=30.0,
+    )
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()
+
+
+# ── Interview agent proxy endpoints ──
+
+@app.get("/agents/{agent_id}/scores/user/me")
+async def proxy_get_user_scores(agent_id: str, request: Request):
+    agent_url = registry.get_url(agent_id)
+    if not agent_url:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
+    user_id = request.state.user_id
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    resp = await _proxy_client.get(
+        f"{agent_url}/scores/user/me",
+        headers={"X-User-Id": user_id},
+        timeout=30.0,
+    )
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()
+
+
+# ── News agent proxy endpoints ──
+
+@app.get("/agents/{agent_id}/preferences")
+async def proxy_get_preferences(agent_id: str, request: Request):
+    agent_url = registry.get_url(agent_id)
+    if not agent_url:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
+    user_id = request.state.user_id
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    resp = await _proxy_client.get(
+        f"{agent_url}/preferences",
+        headers={"X-User-Id": user_id},
+        timeout=30.0,
+    )
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()
+
+
+@app.post("/agents/{agent_id}/preferences")
+async def proxy_save_preferences(agent_id: str, request: Request):
+    agent_url = registry.get_url(agent_id)
+    if not agent_url:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
+    user_id = request.state.user_id
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    body = await request.json()
+    resp = await _proxy_client.post(
+        f"{agent_url}/preferences", json=body,
+        headers={"X-User-Id": user_id},
+        timeout=30.0,
+    )
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "agent-marketplace", "agents": len(registry.get_cards())}
