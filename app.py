@@ -784,6 +784,86 @@ async def proxy_delete_watchlist(agent_id: str, watchlist_id: str, request: Requ
     return {"success": True}
 
 
+# ── Holdings proxy endpoints ──
+
+@app.post("/agents/{agent_id}/holdings")
+async def proxy_create_holding(agent_id: str, request: Request):
+    agent_url = registry.get_url(agent_id)
+    if not agent_url:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
+    user_id = request.state.user_id
+    body = await request.json()
+    resp = await _proxy_client.post(
+        f"{agent_url}/holdings", json=body,
+        headers={"X-User-Id": user_id} if user_id else {},
+        timeout=30.0,
+    )
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()
+
+@app.get("/agents/{agent_id}/holdings")
+async def proxy_list_holdings(agent_id: str, request: Request):
+    agent_url = registry.get_url(agent_id)
+    if not agent_url:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
+    user_id = request.state.user_id
+    resp = await _proxy_client.get(
+        f"{agent_url}/holdings",
+        headers={"X-User-Id": user_id} if user_id else {},
+        timeout=30.0,
+    )
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()
+
+@app.get("/agents/{agent_id}/holdings/performance")
+async def proxy_portfolio_performance(agent_id: str, request: Request):
+    agent_url = registry.get_url(agent_id)
+    if not agent_url:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
+    user_id = request.state.user_id
+    resp = await _proxy_client.get(
+        f"{agent_url}/holdings/performance",
+        headers={"X-User-Id": user_id} if user_id else {},
+        timeout=30.0,
+    )
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()
+
+@app.put("/agents/{agent_id}/holdings/{holding_id}")
+async def proxy_update_holding(agent_id: str, holding_id: str, request: Request):
+    agent_url = registry.get_url(agent_id)
+    if not agent_url:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
+    user_id = request.state.user_id
+    body = await request.json()
+    resp = await _proxy_client.put(
+        f"{agent_url}/holdings/{holding_id}", json=body,
+        headers={"X-User-Id": user_id} if user_id else {},
+        timeout=30.0,
+    )
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()
+
+@app.delete("/agents/{agent_id}/holdings/{holding_id}")
+async def proxy_delete_holding(agent_id: str, holding_id: str, request: Request):
+    agent_url = registry.get_url(agent_id)
+    if not agent_url:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
+    user_id = request.state.user_id
+    resp = await _proxy_client.delete(
+        f"{agent_url}/holdings/{holding_id}",
+        headers={"X-User-Id": user_id} if user_id else {},
+        timeout=30.0,
+    )
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return {"success": True}
+
+
 # ── Profile proxy endpoints ──
 
 @app.get("/agents/{agent_id}/profile/onboard/start")
