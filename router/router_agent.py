@@ -2,17 +2,15 @@ import asyncio
 import logging
 import os
 
-from cachetools import TTLCache
 from langchain_openai import OpenAIEmbeddings
 from pydantic import BaseModel, Field
 
 from agent_sdk.config import settings
+from agent_sdk.cache import RedisCache
 
 logger = logging.getLogger("marketplace.router")
 
-# In-process TTL cache for query embeddings.
-# TTLCache provides O(1) LRU eviction — no manual key iteration needed.
-_embed_cache: TTLCache = TTLCache(maxsize=512, ttl=600)
+_embed_cache: RedisCache = RedisCache(prefix="embed", ttl=600, maxsize=512)
 
 _EMBED_TIMEOUT = 10.0  # seconds before Azure embedding call is abandoned
 
@@ -49,7 +47,15 @@ class EmbeddingRouter:
         self._embeddings: OpenAIEmbeddings | None = None
         self._agent_embeddings: dict[str, list[float]] = {}
         self._agent_descriptions: dict[str, str] = {}
-        self._routing_cache: TTLCache = TTLCache(maxsize=1000, ttl=3600)
+        self._routing_cache: RedisCache = RedisCache(prefix="route", ttl=3600, maxsize=1000)
+
+    async def init(self) -> None:
+        await _embed_cache.init()
+        await self._routing_cache.init()
+
+    async def close(self) -> None:
+        await _embed_cache.close()
+        await self._routing_cache.close()
 
     def _get_embeddings(self) -> OpenAIEmbeddings:
         if self._embeddings is None:
@@ -92,7 +98,7 @@ class EmbeddingRouter:
         if not self._agent_embeddings:
             raise ValueError("No agents indexed. Call build_index() first.")
 
-        cached = _embed_cache.get(query)
+        cached = await _embed_cache.get(query)
         if cached is not None:
             query_embedding = cached
             logger.debug("Embedding cache hit for query (%.60s…)", query)
@@ -103,7 +109,7 @@ class EmbeddingRouter:
             )
             qnorm = sum(x * x for x in raw_query_embedding) ** 0.5
             query_embedding = [x / qnorm for x in raw_query_embedding] if qnorm > 0 else raw_query_embedding
-            _embed_cache[query] = query_embedding
+            await _embed_cache.set(query, query_embedding)
 
         best_agent = None
         best_score = -1.0
@@ -141,18 +147,19 @@ class EmbeddingRouter:
     async def route_with_cache(self, query: str) -> RoutingDecision:
         """route() with in-process TTL cache to skip redundant embedding calls."""
         normalized = query.strip().lower()
-        cached = self._routing_cache.get(normalized)
-        if cached is not None:
-            logger.debug("Routing cache hit — routed to '%s'", cached.agent_name)
-            return cached
+        cached_dict = await self._routing_cache.get(normalized)
+        if cached_dict is not None:
+            decision = RoutingDecision.model_validate(cached_dict)
+            logger.debug("Routing cache hit — routed to '%s'", decision.agent_name)
+            return decision
         decision = await self.route(query)
-        self._routing_cache[normalized] = decision
+        await self._routing_cache.set(normalized, decision.model_dump())
         return decision
 
-    def clear_routing_cache(self) -> None:
+    async def clear_routing_cache(self) -> None:
         """Invalidate all cached routing decisions. Call after registry changes."""
-        self._routing_cache.clear()
-        _embed_cache.clear()
+        await self._routing_cache.clear()
+        await _embed_cache.clear()
         logger.info("Routing and embedding caches cleared")
 
     @staticmethod

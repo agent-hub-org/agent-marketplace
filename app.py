@@ -1,21 +1,19 @@
+from agent_sdk.secrets.akv import load_akv_secrets
+load_akv_secrets()
+
 import asyncio
-import hashlib
 import json
 import logging
 import os
 import re
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
 
-import bcrypt
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, StreamingResponse
-from jose import JWTError, ExpiredSignatureError, jwt as _jwt
-from motor.motor_asyncio import AsyncIOMotorClient
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -26,71 +24,7 @@ from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
 import httpx
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
-_MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-_auth_client: AsyncIOMotorClient | None = None
-
-
-def _users_collection():
-    assert _auth_client is not None, "MongoDB auth client not initialised — lifespan not started"
-    return _auth_client["agent_auth"]["users"]
-
-
-def _refresh_tokens_collection():
-    assert _auth_client is not None, "MongoDB auth client not initialised — lifespan not started"
-    return _auth_client["agent_auth"]["refresh_tokens"]
-
-
-def _hash_token(token: str) -> str:
-    return hashlib.sha256(token.encode()).hexdigest()
-
-_JWT_SECRET = os.getenv("AUTH_JWT_SECRET")
-if not _JWT_SECRET:
-    raise RuntimeError("AUTH_JWT_SECRET environment variable must be set for production security!")
-if len(_JWT_SECRET) < 32:
-    raise RuntimeError("AUTH_JWT_SECRET must be at least 32 characters for HS256 security (got %d)" % len(_JWT_SECRET))
-
-_JWT_ALGORITHM = "HS256"
 _INTERNAL_HEADERS = {"X-Internal-API-Key": os.getenv("INTERNAL_API_KEY")} if os.getenv("INTERNAL_API_KEY") else {}
-
-
-def _create_access_token(user_id: str) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(hours=1)
-    return _jwt.encode({"sub": user_id, "exp": expire, "type": "access"}, _JWT_SECRET, algorithm=_JWT_ALGORITHM)
-
-
-def _create_refresh_token(user_id: str) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(days=7)
-    return _jwt.encode({"sub": user_id, "exp": expire, "type": "refresh"}, _JWT_SECRET, algorithm=_JWT_ALGORITHM)
-
-
-def _decode_token(token: str) -> str | None:
-    """Decode an access token. Rejects refresh tokens to prevent type confusion."""
-    try:
-        payload = _jwt.decode(token, _JWT_SECRET, algorithms=[_JWT_ALGORITHM])
-        if payload.get("type") != "access":
-            logger.warning("JWT type mismatch — expected 'access', got '%s'", payload.get("type"))
-            return None
-        sub = payload.get("sub")
-        if not sub:
-            logger.warning("JWT missing 'sub' claim")
-            return None
-        return sub
-    except ExpiredSignatureError:
-        return None  # expected; no log needed
-    except JWTError as e:
-        logger.warning("JWT decode error: %s", type(e).__name__)
-        return None
-
-
-def _decode_refresh_token(token: str) -> str | None:
-    """Decode a refresh token only."""
-    try:
-        payload = _jwt.decode(token, _JWT_SECRET, algorithms=[_JWT_ALGORITHM])
-        if payload.get("type") != "refresh":
-            return None
-        return payload.get("sub")
-    except JWTError:
-        return None
 
 from config import AGENT_URLS
 from router.registry import AgentRegistry
@@ -101,30 +35,15 @@ load_dotenv()
 
 from agent_sdk.logging import configure_logging
 from agent_sdk.llm_services.model_registry import list_models as _sdk_list_models
+from agent_sdk.auth import KeycloakJWTMiddleware
 configure_logging("marketplace")
 logger = logging.getLogger("marketplace.api")
-
-
-class _JWTDecodeMiddleware(BaseHTTPMiddleware):
-    """Decode the Bearer JWT once per request and cache result in request.state.
-
-    Both the rate limiter key function and endpoint handlers read from
-    request.state.user_id, avoiding redundant cryptographic verification.
-    """
-
-    async def dispatch(self, request, call_next):
-        token = request.cookies.get("access_token")
-        if not token:
-            raw = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-            token = raw or None
-        request.state.user_id = _decode_token(token) if token else None
-        return await call_next(request)
 
 
 def _get_rate_limit_key(request: Request) -> str:
     """Rate-limit by user_id when authenticated, fall back to IP.
 
-    Reads from request.state.user_id set by _JWTDecodeMiddleware — no redundant
+    Reads from request.state.user_id set by KeycloakJWTMiddleware — no redundant
     JWT verification on every request.
     """
     user_id = getattr(request.state, "user_id", None)
@@ -133,7 +52,11 @@ def _get_rate_limit_key(request: Request) -> str:
     return get_remote_address(request)
 
 
-limiter = Limiter(key_func=_get_rate_limit_key)
+_REDIS_URL = os.getenv("REDIS_URL", "")
+limiter = Limiter(
+    key_func=_get_rate_limit_key,
+    **({"storage_uri": _REDIS_URL} if _REDIS_URL else {}),
+)
 
 class _RequestIDMiddleware(BaseHTTPMiddleware):
     """Generate or propagate X-Request-ID for every request."""
@@ -157,23 +80,18 @@ _proxy_client: httpx.AsyncClient | None = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _proxy_client, _auth_client
-    _auth_client = AsyncIOMotorClient(
-        _MONGO_URI,
-        serverSelectionTimeoutMS=5000,
-        socketTimeoutMS=30000,
-    )
+    from agent_sdk.observability import init_sentry
+    init_sentry("marketplace")
+    global _proxy_client
     _proxy_client = httpx.AsyncClient(headers=_INTERNAL_HEADERS, timeout=120.0)
-    await _users_collection().create_index("email", unique=True)
-    await _refresh_tokens_collection().create_index("token_hash", unique=True)
-    await _refresh_tokens_collection().create_index("expires_at", expireAfterSeconds=0)
     await registry.refresh()
     await router.build_index(registry.get_cards())
+    await router.init()
     logger.info("Marketplace started — %d agent(s) registered", len(registry.get_cards()))
     yield
+    await router.close()
     await caller.close()
     await _proxy_client.aclose()
-    _auth_client.close()
     logger.info("Marketplace shutdown")
 
 
@@ -203,9 +121,7 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization", "X-Internal-API-Key", "X-User-Id", "X-Request-ID"],
 )
 app.add_middleware(_RequestIDMiddleware)
-# JWT decode middleware runs innermost (last added = first executed in Starlette)
-# so request.state.user_id is populated before rate limiter key_func and endpoint handlers run.
-app.add_middleware(_JWTDecodeMiddleware)
+app.add_middleware(KeycloakJWTMiddleware)
 
 
 class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -616,7 +532,7 @@ async def refresh_agents():
     cards = registry.get_cards()
     if changed:
         await router.build_index(cards)
-        router.clear_routing_cache()
+        await router.clear_routing_cache()
         logger.info("Agent registry changed — routing and embedding caches cleared")
     return {
         "status": "refreshed" if changed else "no_change",
@@ -930,171 +846,6 @@ async def proxy_upsert_profile(agent_id: str, request: Request):
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     return resp.json()
-
-
-def _parse_error(resp) -> str:
-    try:
-        return resp.json()
-    except Exception:
-        return resp.text or f"Agent returned {resp.status_code}"
-
-
-class RegisterRequest(BaseModel):
-    email: str
-    password: str
-
-
-class LoginRequest(BaseModel):
-    email: str
-    password: str
-
-
-def _set_auth_cookies(response: Response, access_token: str, refresh_token: str) -> None:
-    """Attach httpOnly auth cookies to a response."""
-    is_secure = os.getenv("COOKIE_SECURE", "true").lower() == "true"
-    response.set_cookie(
-        key="access_token", value=access_token,
-        httponly=True, secure=is_secure, samesite="strict",
-        max_age=3600, path="/",
-    )
-    response.set_cookie(
-        key="refresh_token", value=refresh_token,
-        httponly=True, secure=is_secure, samesite="strict",
-        max_age=7 * 24 * 3600, path="/auth/refresh",
-    )
-
-
-async def _store_refresh_token(user_id: str, token: str) -> None:
-    """Persist a hashed refresh token so it can be rotated and revoked."""
-    expire = datetime.now(timezone.utc) + timedelta(days=7)
-    await _refresh_tokens_collection().insert_one({
-        "token_hash": _hash_token(token),
-        "user_id": user_id,
-        "expires_at": expire,
-    })
-
-
-async def _revoke_refresh_token(token: str) -> bool:
-    """Delete a refresh token from the DB. Returns True if it existed."""
-    result = await _refresh_tokens_collection().delete_one({"token_hash": _hash_token(token)})
-    return result.deleted_count > 0
-
-
-@app.post("/auth/register")
-@limiter.limit("10/minute")
-async def register(request: Request, body: RegisterRequest):
-    col = _users_collection()
-    email = body.email.lower().strip()
-    if await col.find_one({"email": email}):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
-    user_id = uuid.uuid4().hex
-    password_hash = (await asyncio.to_thread(bcrypt.hashpw, body.password.encode(), bcrypt.gensalt())).decode()
-    await col.insert_one({
-        "user_id": user_id,
-        "email": email,
-        "password_hash": password_hash,
-        "created_at": datetime.now(timezone.utc),
-    })
-    access = _create_access_token(user_id)
-    refresh = _create_refresh_token(user_id)
-    await _store_refresh_token(user_id, refresh)
-    logger.info("Registered user email='%s'", email)
-    response = JSONResponse(content={
-        "user_id": user_id,
-        "email": email,
-        "token": access,
-        "refresh_token": refresh,
-        "token_issued_at": int(datetime.now(timezone.utc).timestamp() * 1000),
-    })
-    _set_auth_cookies(response, access, refresh)
-    return response
-
-
-@app.post("/auth/login")
-@limiter.limit("10/minute")
-async def login(request: Request, body: LoginRequest):
-    col = _users_collection()
-    user = await col.find_one({"email": body.email.lower().strip()}, {"_id": 0})
-    if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
-    if not await asyncio.to_thread(bcrypt.checkpw, body.password.encode(), user["password_hash"].encode()):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
-    access = _create_access_token(user["user_id"])
-    refresh = _create_refresh_token(user["user_id"])
-    await _store_refresh_token(user["user_id"], refresh)
-    logger.info("Login user='%s'", user["user_id"])
-    response = JSONResponse(content={
-        "user_id": user["user_id"],
-        "email": user["email"],
-        "token": access,
-        "refresh_token": refresh,
-        "token_issued_at": int(datetime.now(timezone.utc).timestamp() * 1000),
-    })
-    _set_auth_cookies(response, access, refresh)
-    return response
-
-
-class RefreshRequest(BaseModel):
-    refresh_token: str
-
-
-class LogoutRequest(BaseModel):
-    refresh_token: str | None = None
-
-
-@app.post("/auth/refresh")
-@limiter.limit("20/minute")
-async def refresh_token_endpoint(request: Request, body: RefreshRequest | None = None):
-    refresh_token_value = (
-        request.cookies.get("refresh_token")
-        or (body.refresh_token if body else None)
-    )
-    if not refresh_token_value:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="No refresh token provided")
-    user_id = _decode_refresh_token(refresh_token_value)
-    if not user_id:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired refresh token")
-    existed = await _revoke_refresh_token(refresh_token_value)
-    if not existed:
-        # Token was not in DB — either already used (replay) or from before rotation was added
-        logger.warning("Refresh token not found in DB for user='%s' — possible replay attack", user_id)
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token already used or revoked")
-    new_refresh = _create_refresh_token(user_id)
-    new_access = _create_access_token(user_id)
-    await _store_refresh_token(user_id, new_refresh)
-    logger.info("Token rotated for user='%s'", user_id)
-    response = JSONResponse(content={
-        "token": new_access,
-        "refresh_token": new_refresh,
-        "token_issued_at": int(datetime.now(timezone.utc).timestamp() * 1000),
-    })
-    _set_auth_cookies(response, new_access, new_refresh)
-    return response
-
-
-@app.post("/auth/logout")
-async def logout(request: Request, body: LogoutRequest | None = None):
-    """Revoke the refresh token so it cannot be reused after logout."""
-    refresh_token_value = (
-        request.cookies.get("refresh_token")
-        or (body.refresh_token if body else None)
-    )
-    if refresh_token_value:
-        user_id = _decode_refresh_token(refresh_token_value)
-        if user_id:
-            revoked = await _revoke_refresh_token(refresh_token_value)
-            if revoked:
-                logger.info("Logout — refresh token revoked for user='%s'", user_id)
-            else:
-                logger.warning(
-                    "Logout — refresh token not found in DB for user='%s' (already revoked or expired)", user_id
-                )
-        else:
-            logger.warning("Logout called with invalid or expired refresh token")
-    response = JSONResponse(content={"status": "logged_out"})
-    response.delete_cookie("access_token", path="/")
-    response.delete_cookie("refresh_token", path="/auth/refresh")
-    return response
 
 
 @app.get("/agents/{agent_id}/history/me")
