@@ -22,6 +22,8 @@ dependencies = [
     "bcrypt (>=4.0.0)",
     "slowapi>=0.1.9",
     "agent-sdk @ file:./agent-sdk",
+    "azure-keyvault-secrets (>=4.8.0,<5)",
+    "azure-identity (>=1.17.0,<2)",
     "prometheus-client (>=0.21.1,<1.0.0)",
     "networkx (>=3.0,<4.0.0)",
     "cachetools (>=5.5.0,<6.0.0)"
@@ -35,4 +37,4 @@ build-backend = "poetry.core.masonry.api"
 package-mode = false
 
 [tool.poetry.dependencies]
-agent-sdk = { path = "./agent-sdk", develop = true, extras = ["akv"] }
+agent-sdk = { path = "./agent-sdk", develop = true }
