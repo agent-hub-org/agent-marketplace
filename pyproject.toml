@@ -21,6 +21,7 @@ dependencies = [
     "motor (>=3.7.1,<4.0.0)",
     "bcrypt (>=4.0.0)",
     "slowapi>=0.1.9",
+    "redis>=4.0.0",
     "agent-sdk @ file:./agent-sdk",
     "azure-keyvault-secrets (>=4.8.0,<5)",
     "azure-identity (>=1.17.0,<2)",
