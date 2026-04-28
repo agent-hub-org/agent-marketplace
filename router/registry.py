@@ -101,25 +101,6 @@ class AgentRegistry:
         """Get a single agent's card by ID."""
         return self._cards.get(agent_id)
 
-    def get_routing_context(self) -> str:
-        """Format all agent descriptions + skills as text for the router LLM."""
-        if not self._cards:
-            return "No agents available."
-
-        lines = []
-        for agent_id, card in self._cards.items():
-            name = card.get("name", agent_id)
-            desc = card.get("description", "No description")
-            skills = card.get("skills", [])
-            skill_strs = []
-            for s in skills:
-                tags = ", ".join(s.get("tags", []))
-                skill_strs.append(f"  - {s.get('name', 'unknown')}: {s.get('description', '')} [tags: {tags}]")
-            skills_block = "\n".join(skill_strs) if skill_strs else "  (no skills listed)"
-            lines.append(f"Agent ID: {agent_id}\nName: {name}\nDescription: {desc}\nSkills:\n{skills_block}")
-
-        return "\n\n".join(lines)
-
     def get_url(self, agent_id: str) -> str | None:
         """Get the base URL for an agent."""
         return self._agent_urls.get(agent_id)

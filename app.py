@@ -5,13 +5,13 @@ import asyncio
 import json
 import logging
 import os
-import re
 import uuid
 from contextlib import asynccontextmanager
 
+import httpx
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
@@ -20,8 +20,6 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
-
-import httpx
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 _INTERNAL_HEADERS = {"X-Internal-API-Key": os.getenv("INTERNAL_API_KEY")} if os.getenv("INTERNAL_API_KEY") else {}
@@ -31,6 +29,8 @@ from bff_router import router as bff_router
 from router.registry import AgentRegistry
 from router.router_agent import EmbeddingRouter, LowConfidenceError
 from router.a2a_caller import AgentCaller
+from router.proxy import create_proxy_router
+from router.streaming import build_marketplace_sse_stream
 
 load_dotenv()
 
@@ -42,11 +42,6 @@ logger = logging.getLogger("marketplace.api")
 
 
 def _get_rate_limit_key(request: Request) -> str:
-    """Rate-limit by user_id when authenticated, fall back to IP.
-
-    Reads from request.state.user_id set by KeycloakJWTMiddleware — no redundant
-    JWT verification on every request.
-    """
     user_id = getattr(request.state, "user_id", None)
     if user_id:
         return f"user:{user_id}"
@@ -59,9 +54,8 @@ limiter = Limiter(
     **({"storage_uri": _REDIS_URL} if _REDIS_URL else {}),
 )
 
-class _RequestIDMiddleware(BaseHTTPMiddleware):
-    """Generate or propagate X-Request-ID for every request."""
 
+class _RequestIDMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
         request.state.request_id = request_id
@@ -70,12 +64,20 @@ class _RequestIDMiddleware(BaseHTTPMiddleware):
         return response
 
 
+class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        return response
+
+
 registry = AgentRegistry(AGENT_URLS)
 router = EmbeddingRouter()
 caller = AgentCaller()
 
-# Persistent proxy client — reused across all proxy endpoints to avoid TCP/TLS
-# handshake overhead on every request. Initialized in lifespan, closed on shutdown.
 _proxy_client: httpx.AsyncClient | None = None
 
 
@@ -108,12 +110,10 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 if os.getenv("HTTPS_REDIRECT", "").lower() == "true":
     app.add_middleware(HTTPSRedirectMiddleware)
 
-# Trust headers from Cloudflare Proxy
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
 _raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:5173")
 _allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
@@ -123,21 +123,13 @@ app.add_middleware(
 )
 app.add_middleware(_RequestIDMiddleware)
 app.add_middleware(KeycloakJWTMiddleware)
-
-
-class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        response = await call_next(request)
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["X-XSS-Protection"] = "1; mode=block"
-        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-        return response
-
 app.add_middleware(_SecurityHeadersMiddleware)
 
 app.include_router(bff_router)
+app.include_router(create_proxy_router(registry, lambda: _proxy_client))
 
+
+# ── Models ──
 
 class QueryRequest(BaseModel):
     query: str
@@ -146,11 +138,6 @@ class QueryRequest(BaseModel):
     model_id: str | None = None
     watchlist_id: str | None = None
     as_of_date: str | None = None
-
-    model_config = {"json_schema_extra": {"examples": [
-        {"query": "Analyze RELIANCE.NS stock", "session_id": None, "response_format": "detailed", "model_id": None, "watchlist_id": None, "as_of_date": None},
-        {"query": "Find papers on transformer architectures", "session_id": None, "response_format": "summary", "model_id": None, "watchlist_id": None, "as_of_date": None},
-    ]}}
 
 
 class QueryResponse(BaseModel):
@@ -178,6 +165,23 @@ class DirectQueryResponse(BaseModel):
     response: str
 
 
+def _resolve_mode(agent_card: dict | None, agent_name: str, body_mode: str | None = None) -> str | None:
+    """Resolve execution mode from body, agent card metadata, or known agent defaults."""
+    if body_mode:
+        return body_mode
+    if agent_card:
+        mode = agent_card.get("metadata", {}).get("mode")
+        if mode:
+            return mode
+    if agent_name == "financial-agent":
+        return "financial_analyst"
+    if agent_name == "research-agent":
+        return "researcher"
+    return None
+
+
+# ── Core routing endpoints ──
+
 @app.post("/query", response_model=QueryResponse)
 @limiter.limit("30/minute")
 async def query(request: Request, body: QueryRequest):
@@ -198,26 +202,16 @@ async def query(request: Request, body: QueryRequest):
             ),
         )
 
-
-    user_id = request.state.user_id
-
-    # Determine mode from agent card metadata
-    agent_card = registry.get_card(decision.agent_name)
-    mode = agent_card.metadata.get("mode") if agent_card and hasattr(agent_card, "metadata") else None
-
-    if not mode:
-        # Fallback for legacy cards or common agents if metadata is missing
-        if decision.agent_name == "financial-agent":
-            mode = "financial_analyst"
-        elif decision.agent_name == "research-agent":
-            mode = "researcher"
-
     agent_url = registry.get_url(decision.agent_name)
     if not agent_url:
         raise HTTPException(
             status_code=404,
             detail=f"Agent '{decision.agent_name}' not found. Available: {list(AGENT_URLS.keys())}",
         )
+
+    user_id = request.state.user_id
+    agent_card = registry.get_card(decision.agent_name)
+    mode = _resolve_mode(agent_card, decision.agent_name)
 
     response_text = await caller.call_agent(
         agent_url, body.query, body.session_id, user_id=user_id, mode=mode,
@@ -251,17 +245,8 @@ async def direct_query(agent_id: str, request: Request, body: DirectQueryRequest
         )
 
     user_id = request.state.user_id
-
-    # Determine mode from agent card metadata
     agent_card = registry.get_card(agent_id)
-    mode = agent_card.metadata.get("mode") if agent_card and hasattr(agent_card, "metadata") else None
-
-    if not mode:
-        # Fallback for legacy cards or common agents if metadata is missing
-        if agent_id == "financial-agent":
-            mode = "financial_analyst"
-        elif agent_id == "research-agent":
-            mode = "researcher"
+    mode = _resolve_mode(agent_card, agent_id, body.mode)
 
     response_text = await caller.call_agent(
         agent_url, body.query, body.session_id, user_id=user_id, mode=mode,
@@ -269,11 +254,7 @@ async def direct_query(agent_id: str, request: Request, body: DirectQueryRequest
         watchlist_id=body.watchlist_id, as_of_date=body.as_of_date,
     )
 
-    return DirectQueryResponse(
-        agent_id=agent_id,
-        query=body.query,
-        response=response_text,
-    )
+    return DirectQueryResponse(agent_id=agent_id, query=body.query, response=response_text)
 
 
 @app.post("/agents/{agent_id}/query/stream")
@@ -290,99 +271,38 @@ async def direct_query_stream(agent_id: str, body: DirectQueryRequest, request: 
         )
 
     user_id = request.state.user_id
-
     agent_card = registry.get_card(agent_id)
-    supports_streaming = (
-        agent_card and agent_card.get("capabilities", {}).get("streaming", False)
-    )
-
+    supports_streaming = agent_card and agent_card.get("capabilities", {}).get("streaming", False)
+    mode = _resolve_mode(agent_card, agent_id, body.mode)
     _request_id = request.state.request_id
 
-    async def event_stream():
-        queue = asyncio.Queue(maxsize=100)
-        _HEARTBEAT_INTERVAL = 15.0
+    async def _source():
+        if supports_streaming:
+            async for chunk in caller.stream_agent(
+                agent_url, body.query, body.session_id,
+                response_format=body.response_format, model_id=body.model_id,
+                mode=mode, user_id=user_id, request_id=_request_id,
+                watchlist_id=body.watchlist_id, as_of_date=body.as_of_date,
+            ):
+                yield chunk
+        else:
+            response_text = await caller.call_agent(
+                agent_url, body.query, body.session_id, user_id=user_id,
+                mode=mode, request_id=_request_id,
+                watchlist_id=body.watchlist_id, as_of_date=body.as_of_date,
+            )
+            yield response_text
 
-        async def heartbeat_worker():
-            try:
-                while True:
-                    await asyncio.sleep(_HEARTBEAT_INTERVAL)
-                    await queue.put(f": heartbeat {int(asyncio.get_running_loop().time())}\n\n")
-            except asyncio.CancelledError:
-                pass
-
-        async def agent_worker():
-            try:
-                if supports_streaming:
-                    async for chunk in caller.stream_agent(agent_url, body.query, body.session_id,
-                                                           response_format=body.response_format,
-                                                           model_id=body.model_id,
-                                                           mode=body.mode,
-                                                           user_id=user_id,
-                                                           request_id=_request_id,
-                                                           watchlist_id=body.watchlist_id,
-                                                           as_of_date=body.as_of_date):
-                        try:
-                            await asyncio.wait_for(queue.put(chunk), timeout=30.0)
-                        except asyncio.TimeoutError:
-                            logger.warning("Stream queue full for agent '%s' — client likely disconnected", agent_id)
-                            return
-                else:
-                    response_text = await caller.call_agent(
-                        agent_url, body.query, body.session_id, user_id=user_id,
-                        mode=body.mode,
-                        request_id=_request_id,
-                        watchlist_id=body.watchlist_id, as_of_date=body.as_of_date,
-                    )
-                    await queue.put(response_text)
-            except Exception as e:
-                logger.error("Stream error for agent '%s': %s", agent_id, e, exc_info=True)
-                await queue.put("__ERROR__:An error occurred while communicating with the agent. Please try again.")
-            finally:
-                try:
-                    queue.put_nowait(None)
-                except asyncio.QueueFull:
-                    pass
-
-        heartbeat_task = asyncio.create_task(heartbeat_worker())
-        agent_task = asyncio.create_task(agent_worker())
-
-        try:
-            while True:
-                chunk = await queue.get()
-                if chunk is None:
-                    break
-
-                if chunk.startswith(": heartbeat"):
-                    yield chunk
-                elif chunk.startswith("__PROGRESS__:"):
-                    phase = chunk[len("__PROGRESS__:"):]
-                    yield f"event: progress\ndata: {json.dumps({'phase': phase})}\n\n"
-                elif chunk.startswith("__ERROR__:"):
-                    error_msg = chunk[len("__ERROR__:"):]
-                    yield f"event: error\ndata: {json.dumps({'message': error_msg})}\n\n"
-                    yield f"data: {json.dumps({'text': error_msg})}\n\n"
-                else:
-                    yield f"data: {json.dumps({'text': chunk})}\n\n"
-        finally:
-            heartbeat_task.cancel()
-            agent_task.cancel()
-            try:
-                await agent_task
-            except asyncio.CancelledError:
-                pass
-            yield "data: [DONE]\n\n"
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        build_marketplace_sse_stream(_source()),
+        media_type="text/event-stream",
+    )
 
 
 @app.post("/query/stream")
 @limiter.limit("30/minute")
 async def query_stream(body: QueryRequest, request: Request):
-    """Route a query to the best agent and stream the response as SSE.
-
-    Checks if the agent supports A2A streaming (message/stream). Falls back
-    to non-streaming call_agent() if not, wrapping the response in SSE format.
-    """
+    """Route a query to the best agent and stream the response as SSE."""
     logger.info("POST /query/stream — query='%s'", body.query[:100])
 
     if not registry.get_cards():
@@ -407,98 +327,39 @@ async def query_stream(body: QueryRequest, request: Request):
         )
 
     user_id = request.state.user_id
-
     agent_card = registry.get_card(decision.agent_name)
-    supports_streaming = (
-        agent_card and agent_card.get("capabilities", {}).get("streaming", False)
-    )
+    supports_streaming = agent_card and agent_card.get("capabilities", {}).get("streaming", False)
+    mode = _resolve_mode(agent_card, decision.agent_name)
+    _request_id = request.state.request_id
 
     from agent_sdk.config import settings as sdk_settings
     _is_low_confidence = decision.confidence < sdk_settings.min_routing_confidence
+    preamble = f"data: {json.dumps({'routed_to': decision.agent_name, 'reasoning': decision.reasoning, 'routing_confidence': decision.confidence, 'low_confidence': _is_low_confidence})}\n\n"
 
-    _request_id = request.state.request_id
-    async def event_stream():
-        queue = asyncio.Queue(maxsize=100)
-        _HEARTBEAT_INTERVAL = 15.0
+    async def _source():
+        if supports_streaming:
+            async for chunk in caller.stream_agent(
+                agent_url, body.query, body.session_id,
+                response_format=body.response_format, model_id=body.model_id,
+                mode=mode, user_id=user_id, request_id=_request_id,
+                watchlist_id=body.watchlist_id, as_of_date=body.as_of_date,
+            ):
+                yield chunk
+        else:
+            response_text = await caller.call_agent(
+                agent_url, body.query, body.session_id, user_id=user_id,
+                mode=mode, request_id=_request_id,
+                watchlist_id=body.watchlist_id, as_of_date=body.as_of_date,
+            )
+            yield response_text
 
-        async def heartbeat_worker():
-            try:
-                while True:
-                    await asyncio.sleep(_HEARTBEAT_INTERVAL)
-                    await queue.put(f": heartbeat {int(asyncio.get_running_loop().time())}\n\n")
-            except asyncio.CancelledError:
-                pass
+    return StreamingResponse(
+        build_marketplace_sse_stream(_source(), preamble=preamble),
+        media_type="text/event-stream",
+    )
 
-        async def agent_worker():
-            try:
-                # Auto-resolve mode from agent card if the client didn't specify one
-                _mode = (body.mode if hasattr(body, "mode") and body.mode
-                         else (agent_card.get("metadata", {}).get("mode") if agent_card else None))
-                if supports_streaming:
-                    async for chunk in caller.stream_agent(agent_url, body.query, body.session_id,
-                                                           response_format=body.response_format,
-                                                           model_id=body.model_id,
-                                                           mode=_mode,
-                                                           user_id=user_id,
-                                                           request_id=_request_id,
-                                                           watchlist_id=body.watchlist_id,
-                                                           as_of_date=body.as_of_date):
-                        try:
-                            await asyncio.wait_for(queue.put(chunk), timeout=30.0)
-                        except asyncio.TimeoutError:
-                            logger.warning("Stream queue full for agent '%s' — client likely disconnected", decision.agent_name)
-                            return
-                else:
-                    response_text = await caller.call_agent(
-                        agent_url, body.query, body.session_id, user_id=user_id,
-                        mode=_mode,
-                        request_id=_request_id,
-                        watchlist_id=body.watchlist_id, as_of_date=body.as_of_date,
-                    )
-                    await queue.put(response_text)
-            except Exception as e:
-                logger.error("Stream error for agent '%s': %s", decision.agent_name, e, exc_info=True)
-                await queue.put("__ERROR__:An error occurred while communicating with the agent. Please try again.")
-            finally:
-                try:
-                    queue.put_nowait(None)
-                except asyncio.QueueFull:
-                    pass
 
-        # Send routing metadata as the first event directly
-        yield f"data: {json.dumps({'routed_to': decision.agent_name, 'reasoning': decision.reasoning, 'routing_confidence': decision.confidence, 'low_confidence': _is_low_confidence})}\n\n"
-
-        heartbeat_task = asyncio.create_task(heartbeat_worker())
-        agent_task = asyncio.create_task(agent_worker())
-
-        try:
-            while True:
-                chunk = await queue.get()
-                if chunk is None:
-                    break
-
-                if chunk.startswith(": heartbeat"):
-                    yield chunk
-                elif chunk.startswith("__PROGRESS__:"):
-                    phase = chunk[len("__PROGRESS__:"):]
-                    yield f"event: progress\ndata: {json.dumps({'phase': phase})}\n\n"
-                elif chunk.startswith("__ERROR__:"):
-                    error_msg = chunk[len("__ERROR__:"):]
-                    yield f"event: error\ndata: {json.dumps({'message': error_msg})}\n\n"
-                    yield f"data: {json.dumps({'text': error_msg})}\n\n"
-                else:
-                    yield f"data: {json.dumps({'text': chunk})}\n\n"
-        finally:
-            heartbeat_task.cancel()
-            agent_task.cancel()
-            try:
-                await agent_task
-            except asyncio.CancelledError:
-                pass
-            yield "data: [DONE]\n\n"
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
-
+# ── Agent management endpoints ──
 
 @app.get("/agents/status")
 async def agents_status():
@@ -509,9 +370,7 @@ async def agents_status():
             async with httpx.AsyncClient(timeout=3.0) as c:
                 r = await c.get(f"{base_url}/health", headers=_INTERNAL_HEADERS)
             latency_ms = round((asyncio.get_running_loop().time() - t0) * 1000)
-            if r.is_success:
-                return agent_id, {"status": "ok", "latencyMs": latency_ms}
-            return agent_id, {"status": "error", "latencyMs": latency_ms}
+            return agent_id, {"status": "ok" if r.is_success else "error", "latencyMs": latency_ms}
         except Exception:
             return agent_id, {"status": "error", "latencyMs": None}
 
@@ -527,10 +386,7 @@ async def list_agents():
 
 @app.post("/agents/refresh")
 async def refresh_agents():
-    """Re-fetch Agent Cards and rebuild the embedding index.
-
-    Skips re-embedding when agent cards are unchanged (returns status 'no_change').
-    """
+    """Re-fetch Agent Cards and rebuild the embedding index."""
     changed = await registry.refresh()
     cards = registry.get_cards()
     if changed:
@@ -548,538 +404,6 @@ async def refresh_agents():
 async def get_models():
     """List available LLM models that can be selected from the frontend."""
     return {"models": _sdk_list_models()}
-
-
-# ── File proxy endpoints (upload / download / list) ──
-
-@app.post("/agents/{agent_id}/upload/{upload_type}")
-async def proxy_upload(agent_id: str, upload_type: str, file: UploadFile = File(...), session_id: str = Form(...)):
-    """Proxy a file upload to the target agent."""
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-
-    file_bytes = await file.read()
-    resp = await _proxy_client.post(
-        f"{agent_url}/upload/{upload_type}",
-        files={"file": (file.filename, file_bytes, file.content_type)},
-        data={"session_id": session_id},
-        timeout=120.0,
-    )
-
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-
-@app.get("/agents/{agent_id}/download/{file_id}")
-async def proxy_download(agent_id: str, file_id: str):
-    """Proxy a file download from the target agent."""
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-
-    resp = await _proxy_client.get(f"{agent_url}/download/{file_id}", timeout=60.0)
-
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-
-    return Response(
-        content=resp.content,
-        media_type=resp.headers.get("content-type", "application/octet-stream"),
-        headers={"Content-Disposition": resp.headers.get("content-disposition", "")},
-    )
-
-
-@app.get("/agents/{agent_id}/files/{session_id}")
-async def proxy_list_files(agent_id: str, session_id: str):
-    """Proxy a file listing request to the target agent."""
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-
-    resp = await _proxy_client.get(f"{agent_url}/files/{session_id}", timeout=30.0)
-
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-
-@app.get("/agents/{agent_id}/charts/{ticker}")
-async def proxy_charts(agent_id: str, ticker: str, request: Request):
-    """Proxy chart data request to the target agent."""
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    params = dict(request.query_params)
-    resp = await _proxy_client.get(f"{agent_url}/charts/{ticker}", params=params, timeout=30.0)
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-
-@app.get("/agents/{agent_id}/quotes")
-async def proxy_quotes(agent_id: str, request: Request):
-    """Proxy live quotes request to the target agent (no auth required)."""
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    params = dict(request.query_params)
-    resp = await _proxy_client.get(f"{agent_url}/quotes", params=params, timeout=15.0)
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-
-# ── Watchlist proxy endpoints ──
-
-@app.post("/agents/{agent_id}/watchlists")
-async def proxy_create_watchlist(agent_id: str, request: Request):
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    user_id = request.state.user_id
-    body = await request.json()
-    resp = await _proxy_client.post(
-        f"{agent_url}/watchlists", json=body,
-        headers={"X-User-Id": user_id} if user_id else {},
-        timeout=30.0,
-    )
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-@app.get("/agents/{agent_id}/watchlists")
-async def proxy_list_watchlists(agent_id: str, request: Request):
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    user_id = request.state.user_id
-    resp = await _proxy_client.get(
-        f"{agent_url}/watchlists",
-        headers={"X-User-Id": user_id} if user_id else {},
-        timeout=30.0,
-    )
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-@app.get("/agents/{agent_id}/watchlists/{watchlist_id}/performance")
-async def proxy_watchlist_performance(agent_id: str, watchlist_id: str, request: Request):
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    user_id = request.state.user_id
-    resp = await _proxy_client.get(
-        f"{agent_url}/watchlists/{watchlist_id}/performance",
-        headers={"X-User-Id": user_id} if user_id else {},
-        timeout=30.0,
-    )
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-@app.get("/agents/{agent_id}/watchlists/{watchlist_id}")
-async def proxy_get_watchlist(agent_id: str, watchlist_id: str, request: Request):
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    user_id = request.state.user_id
-    resp = await _proxy_client.get(
-        f"{agent_url}/watchlists/{watchlist_id}",
-        headers={"X-User-Id": user_id} if user_id else {},
-        timeout=30.0,
-    )
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-@app.put("/agents/{agent_id}/watchlists/{watchlist_id}")
-async def proxy_update_watchlist(agent_id: str, watchlist_id: str, request: Request):
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    user_id = request.state.user_id
-    body = await request.json()
-    resp = await _proxy_client.put(
-        f"{agent_url}/watchlists/{watchlist_id}", json=body,
-        headers={"X-User-Id": user_id} if user_id else {},
-        timeout=30.0,
-    )
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-@app.delete("/agents/{agent_id}/watchlists/{watchlist_id}")
-async def proxy_delete_watchlist(agent_id: str, watchlist_id: str, request: Request):
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    user_id = request.state.user_id
-    resp = await _proxy_client.delete(
-        f"{agent_url}/watchlists/{watchlist_id}",
-        headers={"X-User-Id": user_id} if user_id else {},
-        timeout=30.0,
-    )
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return {"success": True}
-
-
-# ── Holdings proxy endpoints ──
-
-@app.post("/agents/{agent_id}/holdings")
-async def proxy_create_holding(agent_id: str, request: Request):
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    user_id = request.state.user_id
-    body = await request.json()
-    resp = await _proxy_client.post(
-        f"{agent_url}/holdings", json=body,
-        headers={"X-User-Id": user_id} if user_id else {},
-        timeout=30.0,
-    )
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-@app.get("/agents/{agent_id}/holdings")
-async def proxy_list_holdings(agent_id: str, request: Request):
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    user_id = request.state.user_id
-    resp = await _proxy_client.get(
-        f"{agent_url}/holdings",
-        headers={"X-User-Id": user_id} if user_id else {},
-        timeout=30.0,
-    )
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-@app.get("/agents/{agent_id}/holdings/performance")
-async def proxy_portfolio_performance(agent_id: str, request: Request):
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    user_id = request.state.user_id
-    resp = await _proxy_client.get(
-        f"{agent_url}/holdings/performance",
-        headers={"X-User-Id": user_id} if user_id else {},
-        timeout=30.0,
-    )
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-@app.put("/agents/{agent_id}/holdings/{holding_id}")
-async def proxy_update_holding(agent_id: str, holding_id: str, request: Request):
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    user_id = request.state.user_id
-    body = await request.json()
-    resp = await _proxy_client.put(
-        f"{agent_url}/holdings/{holding_id}", json=body,
-        headers={"X-User-Id": user_id} if user_id else {},
-        timeout=30.0,
-    )
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-@app.delete("/agents/{agent_id}/holdings/{holding_id}")
-async def proxy_delete_holding(agent_id: str, holding_id: str, request: Request):
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    user_id = request.state.user_id
-    resp = await _proxy_client.delete(
-        f"{agent_url}/holdings/{holding_id}",
-        headers={"X-User-Id": user_id} if user_id else {},
-        timeout=30.0,
-    )
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return {"success": True}
-
-
-# ── Profile proxy endpoints ──
-
-@app.get("/agents/{agent_id}/profile/onboard/start")
-async def proxy_onboard_start(agent_id: str):
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    resp = await _proxy_client.get(f"{agent_url}/profile/onboard/start", timeout=10.0)
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-@app.get("/agents/{agent_id}/profile")
-async def proxy_get_profile(agent_id: str, request: Request):
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    user_id = request.state.user_id
-    resp = await _proxy_client.get(
-        f"{agent_url}/profile",
-        headers={"X-User-Id": user_id} if user_id else {},
-        timeout=10.0,
-    )
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-@app.put("/agents/{agent_id}/profile")
-async def proxy_upsert_profile(agent_id: str, request: Request):
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    user_id = request.state.user_id
-    body = await request.json()
-    resp = await _proxy_client.put(
-        f"{agent_url}/profile",
-        json=body,
-        headers={"X-User-Id": user_id} if user_id else {},
-        timeout=10.0,
-    )
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-
-@app.get("/agents/{agent_id}/history/me")
-@limiter.limit("60/minute")
-async def proxy_history(agent_id: str, request: Request):
-    """Verify JWT here, then forward user_id to the agent via X-User-Id header."""
-    user_id = request.state.user_id
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    resp = await _proxy_client.get(
-        f"{agent_url}/history/user/me",
-        headers={"X-User-Id": user_id},
-        timeout=30.0,
-    )
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-
-_SAFE_SESSION_RE = re.compile(r'^[a-zA-Z0-9\-]{1,64}$')
-
-
-class _SessionsBody(BaseModel):
-    session_ids: list[str]
-
-@app.post("/agents/{agent_id}/history/sessions")
-@limiter.limit("30/minute")
-async def proxy_history_sessions(agent_id: str, body: _SessionsBody, request: Request):
-    """Retrieve conversations for a list of client-known session IDs."""
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    # Validate session_ids: alphanumeric + hyphens (UUID format), max 64 chars, capped at 20
-    safe_ids = [s for s in body.session_ids[:20] if isinstance(s, str) and _SAFE_SESSION_RE.match(s)]
-    resp = await _proxy_client.post(
-        f"{agent_url}/history/sessions",
-        json={"session_ids": safe_ids},
-        timeout=30.0,
-    )
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-
-# ── Health agent proxy endpoints ──
-
-@app.get("/agents/{agent_id}/progress")
-async def proxy_get_progress(agent_id: str, request: Request):
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    user_id = request.state.user_id
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    params = dict(request.query_params)
-    resp = await _proxy_client.get(
-        f"{agent_url}/progress", params=params,
-        headers={"X-User-Id": user_id},
-        timeout=30.0,
-    )
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-
-@app.get("/agents/{agent_id}/nutrition")
-async def proxy_get_nutrition(agent_id: str, request: Request):
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    user_id = request.state.user_id
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    params = dict(request.query_params)
-    resp = await _proxy_client.get(
-        f"{agent_url}/nutrition", params=params,
-        headers={"X-User-Id": user_id},
-        timeout=30.0,
-    )
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-
-@app.post("/agents/{agent_id}/progress")
-async def proxy_log_progress(agent_id: str, request: Request):
-    """Proxy a progress log entry to the target health agent."""
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    user_id = request.state.user_id
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    body = await request.json()
-    resp = await _proxy_client.post(
-        f"{agent_url}/progress", json=body,
-        headers={"X-User-Id": user_id},
-        timeout=30.0,
-    )
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-
-@app.post("/agents/{agent_id}/nutrition")
-async def proxy_log_nutrition(agent_id: str, request: Request):
-    """Proxy a nutrition log entry to the target health agent."""
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    user_id = request.state.user_id
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    body = await request.json()
-    resp = await _proxy_client.post(
-        f"{agent_url}/nutrition", json=body,
-        headers={"X-User-Id": user_id},
-        timeout=30.0,
-    )
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-
-# ── Interview agent proxy endpoints ──
-
-@app.get("/agents/{agent_id}/scores/user/me")
-async def proxy_get_user_scores(agent_id: str, request: Request):
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    user_id = request.state.user_id
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    resp = await _proxy_client.get(
-        f"{agent_url}/scores/user/me",
-        headers={"X-User-Id": user_id},
-        timeout=30.0,
-    )
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-
-@app.post("/agents/{agent_id}/scores")
-async def proxy_create_score(agent_id: str, request: Request):
-    """Proxy a mock interview score submission to the target agent."""
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    user_id = request.state.user_id
-    body = await request.json()
-    resp = await _proxy_client.post(
-        f"{agent_url}/scores", json=body,
-        headers={"X-User-Id": user_id} if user_id else {},
-        timeout=30.0,
-    )
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-
-@app.post("/agents/{agent_id}/notes/share")
-async def proxy_share_note(agent_id: str, request: Request):
-    """Proxy a shareable-note creation request to the target agent."""
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    body = await request.json()
-    resp = await _proxy_client.post(f"{agent_url}/notes/share", json=body, timeout=30.0)
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-
-@app.get("/agents/{agent_id}/notes/shared/{token}")
-async def proxy_shared_note(agent_id: str, token: str):
-    """Proxy a shared-note download (public, no auth required)."""
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    resp = await _proxy_client.get(f"{agent_url}/notes/shared/{token}", timeout=60.0)
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return Response(
-        content=resp.content,
-        media_type=resp.headers.get("content-type", "application/octet-stream"),
-        headers={"Content-Disposition": resp.headers.get("content-disposition", "")},
-    )
-
-
-# ── News agent proxy endpoints ──
-
-@app.get("/agents/{agent_id}/preferences")
-async def proxy_get_preferences(agent_id: str, request: Request):
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    user_id = request.state.user_id
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    resp = await _proxy_client.get(
-        f"{agent_url}/preferences",
-        headers={"X-User-Id": user_id},
-        timeout=30.0,
-    )
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-
-@app.post("/agents/{agent_id}/preferences")
-async def proxy_save_preferences(agent_id: str, request: Request):
-    agent_url = registry.get_url(agent_id)
-    if not agent_url:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
-    user_id = request.state.user_id
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    body = await request.json()
-    resp = await _proxy_client.post(
-        f"{agent_url}/preferences", json=body,
-        headers={"X-User-Id": user_id},
-        timeout=30.0,
-    )
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
 
 
 @app.get("/health")
