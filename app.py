@@ -81,6 +81,9 @@ caller = AgentCaller()
 _proxy_client: httpx.AsyncClient | None = None
 
 
+_REGISTRY_REFRESH_INTERVAL = int(os.getenv("REGISTRY_REFRESH_INTERVAL", "60"))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from agent_sdk.observability import init_sentry
@@ -91,7 +94,29 @@ async def lifespan(app: FastAPI):
     await router.build_index(registry.get_cards())
     await router.init()
     logger.info("Marketplace started — %d agent(s) registered", len(registry.get_cards()))
+
+    async def _refresh_loop():
+        while True:
+            await asyncio.sleep(_REGISTRY_REFRESH_INTERVAL)
+            try:
+                changed = await registry.refresh()
+                if changed:
+                    await router.build_index(registry.get_cards())
+                    await router.clear_routing_cache()
+                    logger.info("Periodic refresh: registry changed — rebuilt routing index (%d agents)", len(registry.get_cards()))
+            except Exception:
+                logger.exception("Periodic registry refresh failed — will retry in %ds", _REGISTRY_REFRESH_INTERVAL)
+
+    refresh_task = asyncio.create_task(_refresh_loop())
+
     yield
+
+    refresh_task.cancel()
+    try:
+        await refresh_task
+    except asyncio.CancelledError:
+        pass
+
     await router.close()
     await caller.close()
     await _proxy_client.aclose()

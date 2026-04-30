@@ -53,7 +53,7 @@ class AgentRegistry:
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             async def _fetch(agent_id: str, base_url: str) -> tuple[str, dict | None]:
-                url = f"{base_url}/a2a/.well-known/agent.json"
+                url = f"{base_url}/a2a/.well-known/agent-card.json"
                 for attempt in range(3):
                     try:
                         response = await client.get(url)
