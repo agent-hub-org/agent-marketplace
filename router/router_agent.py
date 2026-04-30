@@ -71,26 +71,32 @@ class EmbeddingRouter:
 
         Unit vectors are precomputed so route() only needs a dot product (no norm
         recomputation per query — eliminates O(n) redundant sqrt calls).
+
+        Builds into local dicts first, then atomically swaps them in to avoid
+        concurrent route() calls seeing a partially-populated index.
         """
-        self._agent_embeddings = {}
-        self._agent_descriptions = {}
+        new_descriptions: dict[str, str] = {}
+        new_embeddings: dict[str, list[float]] = {}
 
         for agent_id, card in cards.items():
-            self._agent_descriptions[agent_id] = self._card_to_text(agent_id, card)
+            new_descriptions[agent_id] = self._card_to_text(agent_id, card)
 
-        if not self._agent_descriptions:
+        if not new_descriptions:
             logger.warning("No agent cards to index")
             return
 
-        texts = list(self._agent_descriptions.values())
-        agent_ids = list(self._agent_descriptions.keys())
+        texts = list(new_descriptions.values())
+        agent_ids = list(new_descriptions.keys())
         embeddings = await self._get_embeddings().aembed_documents(texts)
 
         for agent_id, embedding in zip(agent_ids, embeddings):
             # Store as unit vector — dot(unit_a, unit_b) == cosine_similarity(a, b)
             norm = sum(x * x for x in embedding) ** 0.5
-            self._agent_embeddings[agent_id] = [x / norm for x in embedding] if norm > 0 else embedding
+            new_embeddings[agent_id] = [x / norm for x in embedding] if norm > 0 else embedding
 
+        # Atomic swap — route() always sees either the old complete index or the new one.
+        self._agent_descriptions = new_descriptions
+        self._agent_embeddings = new_embeddings
         logger.info("Built embedding index for %d agent(s)", len(self._agent_embeddings))
 
     async def route(self, query: str) -> RoutingDecision:

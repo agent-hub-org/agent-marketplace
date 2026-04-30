@@ -45,10 +45,13 @@ async def build_marketplace_sse_stream(
             logger.error("Marketplace stream producer failed: %s", exc, exc_info=True)
             await queue.put(f"{_ERROR_PREFIX}An error occurred while communicating with the agent. Please try again.")
         finally:
-            try:
-                queue.put_nowait(None)
-            except asyncio.QueueFull:
-                pass
+            # Retry until the sentinel lands — the consumer must receive it to exit.
+            while True:
+                try:
+                    queue.put_nowait(None)
+                    break
+                except asyncio.QueueFull:
+                    await asyncio.sleep(0.05)
 
     if preamble:
         yield preamble
@@ -76,8 +79,9 @@ async def build_marketplace_sse_stream(
     finally:
         heartbeat_task.cancel()
         producer_task.cancel()
-        try:
-            await producer_task
-        except asyncio.CancelledError:
-            pass
+        for t in (heartbeat_task, producer_task):
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
         yield "data: [DONE]\n\n"
