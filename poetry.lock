@@ -47,6 +47,7 @@ develop = true
 
 [package.dependencies]
 a2a-sdk = ">=1.0.0,<2.0.0"
+cachetools = ">=5.0.0,<9.0.0"
 fastapi = ">=0.136.0,<1.0.0"
 httpx = ">=0.28.0,<1.0.0"
 langchain = ">=1.2.12,<2.0.0"
