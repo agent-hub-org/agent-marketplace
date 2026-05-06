@@ -39,6 +39,7 @@ package-mode = false
 
 [tool.poetry.dependencies]
 agent-sdk = { path = "./agent-sdk", develop = true }
+agent-common = { path = "./agent-common", develop = true }
 
 [dependency-groups]
 dev = [

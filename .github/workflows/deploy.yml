@@ -4,12 +4,20 @@ on:
   push:
     tags: ['v*']
 
+# Serialize tag-triggered deploys for the same agent repo so concurrent
+# SDK + common syncs don't race on the OCI VM.
+concurrency:
+  group: deploy-agent-marketplace
+  cancel-in-progress: false
+
 jobs:
   deploy:
     uses: agent-hub-org/deploy/.github/workflows/reusable-deploy.yml@main
     with:
       agent_name: agent-marketplace
       service_name: agent-marketplace
+      release_tag: ${{ github.ref_name }}
     secrets:
       OCI_HOST: ${{ secrets.OCI_HOST }}
       OCI_SSH_KEY: ${{ secrets.OCI_SSH_KEY }}
+      OCI_SSH_FINGERPRINT: ${{ secrets.OCI_SSH_FINGERPRINT }}
