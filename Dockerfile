@@ -6,10 +6,11 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir poetry
+RUN pip install --no-cache-dir poetry==2.4.0
 
 COPY pyproject.toml poetry.lock ./
 COPY agent-sdk/ ./agent-sdk/
+COPY agent-common/ ./agent-common/
 RUN poetry config virtualenvs.in-project true && \
     poetry install --only main --no-interaction --no-ansi
 
