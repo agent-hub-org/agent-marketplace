@@ -23,6 +23,7 @@ dependencies = [
     "slowapi>=0.1.9",
     "redis>=5.2.0",
     "agent-sdk @ file:./agent-sdk",
+    "agent-common @ file:./agent-common",
     "azure-keyvault-secrets (>=4.8.0,<5)",
     "azure-identity (>=1.17.0,<2)",
     "prometheus-client (>=0.21.1,<1.0.0)",
